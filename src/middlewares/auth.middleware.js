@@ -5,11 +5,32 @@ import { logAuditEvent } from "../services/immudb.service.js";
 // Make crypto available globally for jose
 globalThis.crypto = webcrypto;
 
-const JWKS = createRemoteJWKSet(
-  new URL(
-    `${process.env.KEYCLOAK_BASE_URL}/realms/${process.env.KEYCLOAK_REALM}/protocol/openid-connect/certs`
-  )
-);
+let jwks;
+function getJWKS() {
+  if (jwks) {
+    return jwks;
+  }
+
+  const baseUrlRaw = process.env.KEYCLOAK_BASE_URL;
+  const realmRaw = process.env.KEYCLOAK_REALM;
+
+  const baseUrl = typeof baseUrlRaw === 'string' ? baseUrlRaw.trim() : '';
+  const realm = typeof realmRaw === 'string' ? realmRaw.trim() : '';
+
+  if (!baseUrl || !realm) {
+    throw new Error(
+      `Keycloak env not configured. Required KEYCLOAK_BASE_URL and KEYCLOAK_REALM. Got KEYCLOAK_BASE_URL='${baseUrlRaw ?? ''}' KEYCLOAK_REALM='${realmRaw ?? ''}'`
+    );
+  }
+
+  const normalizedBaseUrl = baseUrl.startsWith('http://') || baseUrl.startsWith('https://')
+    ? baseUrl
+    : `http://${baseUrl}`;
+
+  const jwksUrl = new URL(`/realms/${realm}/protocol/openid-connect/certs`, normalizedBaseUrl);
+  jwks = createRemoteJWKSet(jwksUrl);
+  return jwks;
+}
 
 export async function verifyJWT(req, res, next) {
   try {
@@ -32,7 +53,7 @@ export async function verifyJWT(req, res, next) {
 
     const token = authHeader.split(" ")[1];
 
-    const { payload } = await jwtVerify(token, JWKS, {
+    const { payload } = await jwtVerify(token, getJWKS(), {
       // ⚠️ DO NOT hard-fail issuer in dev / SSH tunnel setups
       // issuer removed intentionally
     });
