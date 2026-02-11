@@ -1,0 +1,26 @@
+{
+  "name": "anon-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "nodemon server.js",
+    "start": "node src/server.js",
+    "test:e2e": "node test-e2e.js",
+    "test:audit": "node verify-audit.js",
+    "test:immudb": "node test-immudb-audit.js",
+    "setup:immudb": "node setup-immudb.mjs",
+    "setup:immudb:defaultdb": "node setup-immudb-defaultdb.mjs",
+    "diagnose:immudb": "node diagnose-immudb.mjs",
+    "immudb:check": "node test-db-access.mjs"
+  },
+  "dependencies": {
+    "axios": "^1.13.4",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "immudb-node": "^1.1.1",
+    "jose": "^6.1.3",
+    "nodemon": "^3.1.9",
+    "uuid": "^13.0.0"
+  }
+}
