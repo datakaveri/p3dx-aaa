@@ -1,2 +1,10 @@
 .env
 node_modules/
+Setup.md
+setup-immudb.mjs
+diagnose-immudb.mjs
+test-e2e.mjs
+test-immudb.mjs
+test-audit.mjs
+Anon-Auth-Setup-Runbook.txt
+Anon-Auth-Setup-Runbook.md
