@@ -113,11 +113,17 @@ async function setupImmuDB() {
     // Step 7: Test write permission
     console.log('Step 7: Testing write permission...');
     try {
-      await userClient.set('setup:test:' + Date.now(), 'ImmuDB is ready for audit logging');
+      const writeKey = 'setup:test:' + Date.now();
+      await userClient.set({
+        key: writeKey,
+        value: 'ImmuDB is ready for audit logging',
+      });
       console.log('✓ Write test successful\n');
       
       // Test read
-      const result = await userClient.get('setup:test:' + (Date.now() - 100));
+      await userClient.get({
+        key: writeKey,
+      });
       console.log('✓ Read test successful\n');
     } catch (err) {
       console.log('⚠ Read/Write test:', err.message);

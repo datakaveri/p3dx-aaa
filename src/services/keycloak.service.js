@@ -105,11 +105,37 @@ export async function getUserId(username, adminToken) {
 export async function assignUserRole(userId, adminToken) {
   const { baseUrl, realm } = getKeycloakConfig();
   const roleUrl = `${baseUrl}/admin/realms/${realm}/roles/user`;
+  const rolesUrl = `${baseUrl}/admin/realms/${realm}/roles`;
   const mappingUrl = `${baseUrl}/admin/realms/${realm}/users/${userId}/role-mappings/realm`;
 
-  const roleRes = await axios.get(roleUrl, {
-    headers: { Authorization: `Bearer ${adminToken}` },
-  });
+  let roleRes;
+  try {
+    roleRes = await axios.get(roleUrl, {
+      headers: { Authorization: `Bearer ${adminToken}` },
+    });
+  } catch (err) {
+    if (err.response?.status === 404) {
+      await axios.post(
+        rolesUrl,
+        {
+          name: 'user',
+          description: 'Application user role',
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${adminToken}`,
+            'Content-Type': 'application/json',
+          },
+        }
+      );
+
+      roleRes = await axios.get(roleUrl, {
+        headers: { Authorization: `Bearer ${adminToken}` },
+      });
+    } else {
+      throw err;
+    }
+  }
 
   await axios.post(
     mappingUrl,
