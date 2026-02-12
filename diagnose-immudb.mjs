@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import pkg from 'immudb-node';
 
 const ImmudbClient = pkg.default;
@@ -5,20 +6,25 @@ const ImmudbClient = pkg.default;
 async function diagnose() {
   console.log('\n🔍 ImmuDB Diagnostic Check\n');
 
+  const host = process.env.IMMUDB_HOST || '127.0.0.1';
+  const port = Number.parseInt(process.env.IMMUDB_PORT || '3322', 10);
+  const appUser = process.env.IMMUDB_USER || 'anon_backend';
+  const appPassword = process.env.IMMUDB_PASSWORD;
+
   const credentials = [
     { user: 'immudb', password: 'immudb' },
     { user: 'immudb', password: '' },
-    { user: 'anon_backend', password: 'AnonBackend@123' },
+    ...(appPassword ? [{ user: appUser, password: appPassword }] : []),
   ];
 
   for (const cred of credentials) {
     try {
       const client = new ImmudbClient({
-        host: '127.0.0.1',
-        port: 3322,
+        host,
+        port,
       });
 
-      console.log(`Trying: ${cred.user} / ${cred.password || '(empty)'}`);
+      console.log(`Trying: ${cred.user} / ${cred.password ? '********' : '(empty)'}`);
       
       await client.login({
         user: cred.user,

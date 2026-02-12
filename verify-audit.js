@@ -3,6 +3,8 @@
  * Retrieves and displays audit events from immuDB
  */
 
+import 'dotenv/config';
+
 import pkg from 'immudb-node';
 
 const ImmudbClient = pkg.default;
@@ -37,6 +39,11 @@ async function scanAllByPrefix(client, prefix) {
 }
 
 async function verifyAuditLogs() {
+  const password = process.env.IMMUDB_PASSWORD;
+  if (!password) {
+    throw new Error('IMMUDB_PASSWORD is required. Set it in your local .env');
+  }
+
   const client = new ImmudbClient({
     host: process.env.IMMUDB_HOST || '127.0.0.1',
     port: parseInt(process.env.IMMUDB_PORT || 3322),
@@ -46,7 +53,7 @@ async function verifyAuditLogs() {
     console.log('🔐 Connecting to immuDB...');
     await client.login({
       user: process.env.IMMUDB_USER || 'anon_backend',
-      password: process.env.IMMUDB_PASSWORD || 'AnonBackend@123',
+      password,
     });
 
     console.log('✓ Connected to immuDB');

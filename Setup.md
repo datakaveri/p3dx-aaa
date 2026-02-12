@@ -101,7 +101,7 @@ Inside `psql`:
 
 ```sql
 CREATE DATABASE keycloak;
-CREATE USER keycloak_admin WITH PASSWORD 'AdminDB@123';
+CREATE USER keycloak_admin WITH PASSWORD '<KEYCLOAK_DB_PASSWORD>';
 ALTER DATABASE keycloak OWNER TO keycloak_admin;
 GRANT ALL PRIVILEGES ON DATABASE keycloak TO keycloak_admin;
 ```
@@ -167,7 +167,7 @@ bin/kc.sh start-dev \
   --db=postgres \
   --db-url="jdbc:postgresql://localhost:5432/keycloak" \
   --db-username=keycloak_admin \
-  --db-password='AdminDB@123'
+  --db-password='<KEYCLOAK_DB_PASSWORD>'
 ```
 
 Expected log hints:
@@ -197,8 +197,8 @@ Keycloak will prompt you to create the first admin user.
 
 Known working credentials (current system state):
 
-- Admin username: `keycloak-admin`
-- Admin password: `Sfgb3iDU5iAW`
+- Admin username: `<KEYCLOAK_ADMIN_USER>`
+- Admin password: `<KEYCLOAK_ADMIN_PASSWORD>`
 
 ---
 
@@ -271,7 +271,7 @@ sudo docker exec -it immudb immuadmin user create anon_backend readwrite anon_au
 Known working app user:
 
 - `anon_backend`
-- Password: `AnonBackend@123`
+- Password: `<IMMUDB_PASSWORD>`
 - Database: `anon_audit`
 
 ---
@@ -294,6 +294,8 @@ npm install
 ### 9.3 Configure environment
 
 Edit `.env` in `anon-backend/`.
+
+You can start by copying `.env.example` to `.env`.
 
 Key variables:
 
@@ -607,7 +609,7 @@ bin/kc.sh start-dev \
   --db=postgres \
   --db-url="jdbc:postgresql://localhost:5432/keycloak" \
   --db-username=keycloak_admin \
-  --db-password='AdminDB@123'
+  --db-password='<KEYCLOAK_DB_PASSWORD>'
 ```
 
 ### Start immuDB

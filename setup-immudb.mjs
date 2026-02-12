@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import pkg from 'immudb-node';
 
 const ImmudbClient = pkg.default;
@@ -7,28 +8,36 @@ async function setupImmuDB() {
   console.log('║        ImmuDB Setup for Audit Logging                      ║');
   console.log('╚════════════════════════════════════════════════════════════╝\n');
 
+  const host = process.env.IMMUDB_HOST || '127.0.0.1';
+  const port = Number.parseInt(process.env.IMMUDB_PORT || '3322', 10);
+  const adminUser = process.env.IMMUDB_ADMIN_USER || 'immudb';
+  const adminPassword = process.env.IMMUDB_ADMIN_PASSWORD || 'immudb';
+  const database = process.env.IMMUDB_DATABASE || 'anon_audit';
+  const appUser = process.env.IMMUDB_USER || 'anon_backend';
+  const appPassword = process.env.IMMUDB_PASSWORD;
+
   const adminClient = new ImmudbClient({
-    host: '127.0.0.1',
-    port: 3322,
+    host,
+    port,
   });
 
   try {
     // Step 1: Connect as admin
     console.log('Step 1: Connecting to ImmuDB as admin...');
     await adminClient.login({
-      user: 'immudb',
-      password: 'immudb',
+      user: adminUser,
+      password: adminPassword,
     });
     console.log('✓ Connected to ImmuDB as admin\n');
 
     // Step 2: Create the audit database
-    console.log('Step 2: Creating audit database (anon_audit)...');
+    console.log(`Step 2: Creating audit database (${database})...`);
     try {
-      const result = await adminClient.createDatabase({ databasename: 'anon_audit' });
-      console.log('✓ Database created: anon_audit\n');
+      await adminClient.createDatabase({ databasename: database });
+      console.log(`✓ Database created: ${database}\n`);
     } catch (err) {
       if (err.message?.includes('already exists') || err.message?.includes('exists')) {
-        console.log('ℹ Database already exists: anon_audit\n');
+        console.log(`ℹ Database already exists: ${database}\n`);
       } else {
         throw err;
       }
@@ -42,31 +51,34 @@ async function setupImmuDB() {
     }
 
     // Step 3: Create or verify anon_backend user
-    console.log('Step 3: Setting up anon_backend user...');
+    console.log(`Step 3: Setting up ${appUser} user...`);
+    if (!appPassword) {
+      throw new Error('IMMUDB_PASSWORD is required for creating/verifying the app user. Set it in your local .env');
+    }
     try {
       await adminClient.createUser({
-        user: 'anon_backend',
-        password: 'AnonBackend@123',
-        database: 'anon_audit',
+        user: appUser,
+        password: appPassword,
+        database,
         permission: 2,
       });
-      console.log('✓ User created: anon_backend\n');
+      console.log(`✓ User created: ${appUser}\n`);
     } catch (err) {
       if (err.message?.includes('already exists') || err.message?.includes('exists')) {
-        console.log('ℹ User already exists: anon_backend\n');
+        console.log(`ℹ User already exists: ${appUser}\n`);
       } else {
         throw err;
       }
     }
 
     // Step 4: Grant permissions
-    console.log('Step 4: Granting read/write permissions on anon_audit database...');
+    console.log(`Step 4: Granting read/write permissions on ${database} database...`);
     try {
       // Note: Permission format might vary by version - trying common approaches
       await adminClient.changeUserPassword({
-        user: 'anon_backend',
-        oldPassword: 'AnonBackend@123',
-        newPassword: 'AnonBackend@123',
+        user: appUser,
+        oldPassword: appPassword,
+        newPassword: appPassword,
       });
       console.log('✓ User configured\n');
     } catch (err) {
@@ -74,25 +86,25 @@ async function setupImmuDB() {
     }
 
     // Step 5: Test connection as anon_backend
-    console.log('Step 5: Testing connection as anon_backend...');
+    console.log(`Step 5: Testing connection as ${appUser}...`);
     const userClient = new ImmudbClient({
-      host: '127.0.0.1',
-      port: 3322,
+      host,
+      port,
     });
 
     await userClient.login({
-      user: 'anon_backend',
-      password: 'AnonBackend@123',
+      user: appUser,
+      password: appPassword,
     });
-    console.log('✓ Successfully logged in as anon_backend\n');
+    console.log(`✓ Successfully logged in as ${appUser}\n`);
 
     // Step 6: Select database
-    console.log('Step 6: Selecting anon_audit database...');
+    console.log(`Step 6: Selecting ${database} database...`);
     try {
       await userClient.useDatabase({
-        databasename: 'anon_audit',
+        databasename: database,
       });
-      console.log('✓ Database selected: anon_audit\n');
+      console.log(`✓ Database selected: ${database}\n`);
     } catch (err) {
       console.log('⚠ Could not select database:', err.message);
       console.log('  (This may require admin configuration)\n');
@@ -121,11 +133,11 @@ async function setupImmuDB() {
     console.log('╚════════════════════════════════════════════════════════════╝\n');
 
     console.log('Configuration:');
-    console.log('  Database:  anon_audit');
-    console.log('  User:      anon_backend');
-    console.log('  Password:  AnonBackend@123');
-    console.log('  Host:      127.0.0.1');
-    console.log('  Port:      3322');
+    console.log(`  Database:  ${database}`);
+    console.log(`  User:      ${appUser}`);
+    console.log('  Password:  (from IMMUDB_PASSWORD in .env)');
+    console.log(`  Host:      ${host}`);
+    console.log(`  Port:      ${port}`);
     console.log('\n.env file is pre-configured in your backend.\n');
     console.log('Next steps:');
     console.log('  1. npm start          (start the backend)');
