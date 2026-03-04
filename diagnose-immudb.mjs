@@ -4,7 +4,7 @@ import pkg from 'immudb-node';
 const ImmudbClient = pkg.default;
 
 async function diagnose() {
-  console.log('\n🔍 ImmuDB Diagnostic Check\n');
+  console.log('\nImmuDB Diagnostic Check\n');
 
   const host = process.env.IMMUDB_HOST || '127.0.0.1';
   const port = Number.parseInt(process.env.IMMUDB_PORT || '3322', 10);
@@ -61,7 +61,7 @@ async function diagnose() {
     }
   }
 
-  console.log('🔍 Diagnostic complete\n');
+  console.log('Diagnostic complete\n');
 }
 
 diagnose();

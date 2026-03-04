@@ -55,6 +55,28 @@ async function setupImmuDB() {
     if (!appPassword) {
       throw new Error('IMMUDB_PASSWORD is required for creating/verifying the app user. Set it in your local .env');
     }
+
+    async function ensurePermission() {
+      const attempts = [
+        () => adminClient.changePermission?.({ user: appUser, database, permission: 2 }),
+        () => adminClient.changePermission?.({ username: appUser, database, permission: 2 }),
+        () => adminClient.changePermission?.({ user: appUser, database, permission: 2, action: 2 }),
+        () => adminClient.setPermission?.({ user: appUser, database, permission: 2 }),
+        () => adminClient.setPermission?.({ username: appUser, database, permission: 2 }),
+      ].filter(fn => typeof fn === 'function');
+
+      for (const attempt of attempts) {
+        try {
+          await attempt();
+          return true;
+        } catch {
+          // ignore
+        }
+      }
+
+      return false;
+    }
+
     try {
       await adminClient.createUser({
         user: appUser,
@@ -66,6 +88,11 @@ async function setupImmuDB() {
     } catch (err) {
       if (err.message?.includes('already exists') || err.message?.includes('exists')) {
         console.log(`ℹ User already exists: ${appUser}\n`);
+
+        const permissionUpdated = await ensurePermission();
+        if (permissionUpdated) {
+          console.log(`✓ Permissions ensured for ${appUser} on ${database}\n`);
+        }
       } else {
         throw err;
       }

@@ -245,10 +245,10 @@ There are two supported approaches.
 
 #### Approach A (recommended / automated)
 
-From `anon-backend/`:
+From repo root:
 
 ```bash
-cd ~/anon-backend
+cd ~/p3dx-aaa
 npm run setup:immudb
 ```
 
@@ -287,13 +287,13 @@ Known working app user:
 ### 9.2 Install dependencies
 
 ```bash
-cd ~/anon-backend
+cd ~/p3dx-aaa
 npm install
 ```
 
 ### 9.3 Configure environment
 
-Edit `.env` in `anon-backend/`.
+Edit `.env` in repo root.
 
 You can start by copying `.env.example` to `.env`.
 
@@ -304,13 +304,15 @@ PORT=3000
 
 KEYCLOAK_BASE_URL=http://localhost:8080
 KEYCLOAK_REALM=master
-KEYCLOAK_ADMIN_USER=keycloak-admin
+KEYCLOAK_ADMIN_USER=...
 KEYCLOAK_ADMIN_PASSWORD=... 
 KEYCLOAK_CLIENT_ID=anon-backend
 KEYCLOAK_CLIENT_SECRET=...
 
 IMMUDB_HOST=127.0.0.1
 IMMUDB_PORT=3322
+IMMUDB_ADMIN_USER=immudb
+IMMUDB_ADMIN_PASSWORD=immudb
 IMMUDB_USER=anon_backend
 IMMUDB_PASSWORD=...
 IMMUDB_DATABASE=anon_audit
@@ -376,7 +378,7 @@ Event types logged:
 
 ## 12) Verification / test commands
 
-From `anon-backend/`:
+From repo root:
 
 ### 12.1 Diagnose immuDB connectivity
 
@@ -409,7 +411,6 @@ npm run test:audit
 This repo was intentionally cleaned down to only:
 
 - The runtime backend (`src/`)
-- This handover document (`HANDOVER.md`)
 - A minimal set of operational scripts that help a new teammate:
   - Provision immuDB (once)
   - Diagnose connectivity
@@ -443,7 +444,7 @@ npm run setup:immudb
 - **How to run**
 
 ```bash
-cd ~/anon-backend
+cd ~/p3dx-aaa
 npm run diagnose:immudb
 ```
 
@@ -458,7 +459,7 @@ npm run diagnose:immudb
 - **How to run**
 
 ```bash
-cd ~/anon-backend
+cd ~/p3dx-aaa
 npm run test:e2e
 ```
 
@@ -474,7 +475,7 @@ npm run test:e2e
 - **How to run**
 
 ```bash
-cd ~/anon-backend
+cd ~/p3dx-aaa
 npm run test:immudb
 ```
 
@@ -489,7 +490,7 @@ npm run test:immudb
 - **How to run**
 
 ```bash
-cd ~/anon-backend
+cd ~/p3dx-aaa
 npm run test:audit
 ```
 
@@ -500,7 +501,7 @@ npm run test:audit
 - **How to start**
 
 ```bash
-cd ~/anon-backend
+cd ~/p3dx-aaa
 npm start
 ```
 
@@ -509,8 +510,7 @@ npm start
 - **`npm start`**
   - Runs `node src/server.js`
 - **`npm run dev`**
-  - Runs `nodemon server.js` (auto-reload during development)
-  - Note: this assumes the dev entry file exists/works in your environment; production usage should use `npm start`
+  - Runs `nodemon src/server.js` (auto-reload during development)
 - **`npm run setup:immudb`**
   - Runs `node setup-immudb.mjs`
 - **`npm run diagnose:immudb`**
@@ -621,7 +621,7 @@ sudo docker start immudb
 ### Start backend
 
 ```bash
-cd ~/anon-backend
+cd ~/p3dx-aaa
 npm start
 ```
 

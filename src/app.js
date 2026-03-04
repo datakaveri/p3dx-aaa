@@ -11,13 +11,19 @@ const app = express();
  */
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin: [
+      "https://spider.p3dx.iudx.org.in",
+      "http://localhost:5173",
+      "http://localhost:5174",
+      "https://login.p3dx.iudx.org.in",
+    ],
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-app.use(express.json());
+app.use(express.json({ limit: "5mb" }));
+app.use(express.text({ type: ['text/*', 'application/jwt'] }));
 
 app.use("/anon", anonRoutes);
 
