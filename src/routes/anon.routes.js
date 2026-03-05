@@ -7,7 +7,7 @@ import {
   loginUser,
 } from '../services/keycloak.service.js';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
-import { requireRole } from '../middlewares/role.middleware.js';
+import { requireAnyRole, requireRole } from '../middlewares/role.middleware.js';
 import { logAuditEvent, storeMaaTokens } from '../services/immudb.service.js';
 
 
@@ -120,7 +120,7 @@ router.post('/login', async (req, res, next) => {
 router.get(
   '/me',
   verifyJWT,
-  requireRole('user'),
+  requireAnyRole(['user', 'admin']),
   async (req, res) => {
     // Log profile access
     await logAuditEvent('USER_PROFILE_ACCESS', req.user.preferred_username, {

@@ -283,3 +283,7 @@ export async function storeMaaTokens({ keycloakToken, userId, maaTokens, metadat
 
   return { stored, errors };
 }
+
+export function getImmuDBClient() {
+  return client;
+}

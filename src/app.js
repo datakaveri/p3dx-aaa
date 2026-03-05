@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import anonRoutes from "./routes/anon.routes.js";
+import p3dxRoutes from "./routes/p3dx.routes.js";
 import errorMiddleware from "./middlewares/error.middleware.js";
 
 const app = express();
@@ -15,6 +16,7 @@ app.use(
       "https://spider.p3dx.iudx.org.in",
       "http://localhost:5173",
       "http://localhost:5174",
+      "http://localhost:5175",
       "https://login.p3dx.iudx.org.in",
     ],
     methods: ["GET", "POST", "OPTIONS"],
@@ -26,7 +28,10 @@ app.use(express.json({ limit: "5mb" }));
 app.use(express.text({ type: ['text/*', 'application/jwt'] }));
 
 app.use("/anon", anonRoutes);
+app.use("/p3dx", p3dxRoutes);
 
 app.use(errorMiddleware);
 
 export default app;
+
+

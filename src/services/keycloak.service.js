@@ -99,12 +99,10 @@ export async function getUserId(username, adminToken) {
   return response.data[0].id;
 }
 
-/**
- * Assign realm role "user" to the user
- */
-export async function assignUserRole(userId, adminToken) {
+export async function assignRealmRole(userId, roleName, adminToken) {
   const { baseUrl, realm } = getKeycloakConfig();
-  const roleUrl = `${baseUrl}/admin/realms/${realm}/roles/user`;
+
+  const roleUrl = `${baseUrl}/admin/realms/${realm}/roles/${encodeURIComponent(roleName)}`;
   const rolesUrl = `${baseUrl}/admin/realms/${realm}/roles`;
   const mappingUrl = `${baseUrl}/admin/realms/${realm}/users/${userId}/role-mappings/realm`;
 
@@ -118,8 +116,7 @@ export async function assignUserRole(userId, adminToken) {
       await axios.post(
         rolesUrl,
         {
-          name: 'user',
-          description: 'Application user role',
+          name: roleName,
         },
         {
           headers: {
@@ -152,6 +149,13 @@ export async function assignUserRole(userId, adminToken) {
       },
     }
   );
+}
+
+/**
+ * Assign realm role "user" to the user
+ */
+export async function assignUserRole(userId, adminToken) {
+  await assignRealmRole(userId, 'user', adminToken);
 }
 
 /**
