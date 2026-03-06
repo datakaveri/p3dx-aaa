@@ -1,10 +1,10 @@
-# Anon Auth System — Full Setup & Handover Guide
+# p3dx-aaa Auth System — Full Setup & Handover Guide
 
 This document describes the complete end-to-end setup for:
 
 - Keycloak (IdP) running on an Azure VM (Ubuntu 24.04)
 - PostgreSQL (Keycloak internal DB) running locally on the VM
-- anon-backend (Node.js/Express) running on the VM
+- p3dx-aaa auth backend (Node.js/Express) running on the VM
 - immuDB (audit ledger) running on the VM (Docker)
 - Optional: React/Vite frontend running on a developer laptop
 
@@ -16,17 +16,17 @@ It is written so a teammate can reproduce the full environment from scratch.
 
 Frontend (React/Vite, local dev)
   -> HTTP JSON
-anon-backend (Node.js/Express, VM, port 3000)
+p3dx-aaa auth backend (Node.js/Express, VM, port 3000)
   -> Keycloak Admin API + OIDC token endpoint
 Keycloak (VM, port 8080)
   -> PostgreSQL (VM local service, port 5432)
 
 Policy storage (optional local dev):
 
-anon-backend -> APD (Go) (VM local, port 8082)
+p3dx-aaa auth backend -> APD (Go) (VM local, port 8082)
 
 Audit logging:
-anon-backend -> immuDB (VM, port 3322)
+p3dx-aaa auth backend -> immuDB (VM, port 3322)
 
 ---
 
@@ -36,7 +36,7 @@ anon-backend -> immuDB (VM, port 3322)
 
 - SSH: `22`
 - Keycloak: `8080` (dev mode typically binds to all interfaces)
-- anon-backend: `3000`
+- p3dx-aaa auth backend: `3000`
 - PostgreSQL (Keycloak DB): `5432` (local to VM)
 - immuDB: `3322`
 - APD (Go, local dev): `8082` (optional; used for policy submissions)
@@ -196,7 +196,7 @@ Keycloak will prompt you to create the first admin user.
 
 ---
 
-## 7) Keycloak realm/client configuration for anon-backend
+## 7) Keycloak realm/client configuration for p3dx-aaa auth backend
 
 ### 7.1 Realm
 
@@ -264,7 +264,7 @@ sudo docker exec -it immudb immuadmin user create anon_backend readwrite anon_au
 
 ---
 
-## 9) anon-backend setup
+## 9) p3dx-aaa auth backend setup
 
 ### 9.1 Prerequisites
 
@@ -399,7 +399,7 @@ npm start
 Expected output:
 
 - `✓ immuDB connected and database selected`
-- `Anon backend running on port 3000`
+- `p3dx-aaa auth backend running on port 3000`
 
 Development mode:
 
@@ -553,7 +553,7 @@ This repo was intentionally cleaned down to only:
 - **How to run**
 
 ```bash
-cd ~/anon-backend
+cd ~/p3dx-aaa
 npm run setup:immudb
 ```
 

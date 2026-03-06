@@ -2,7 +2,9 @@
 
 ## What this repo contains
 
-This repo currently hosts the **Anon backend** (auth API + audit logging).
+This repo hosts the **p3dx-aaa auth backend** (auth API + audit logging).
+
+Note: `anon` is one module/route group within the backend (mounted under `/anon`).
 
 ## Documentation
 
