@@ -1,5 +1,6 @@
 import pkg from 'immudb-node';
 import { v4 as uuidv4 } from 'uuid';
+import { createHash } from 'crypto';
 
 const ImmudbClient = pkg.default;
 
@@ -226,4 +227,59 @@ export async function getAuditEventsBySubject(subjectId) {
     console.error(`✗ Failed to retrieve audit events by subject: ${err.message}`);
     return [];
   }
+}
+
+export async function storeMaaTokens({ keycloakToken, userId, maaTokens, metadata = {} }) {
+  const errors = [];
+
+  if (!client) {
+    console.warn('⚠ immuDB not initialized, skipping MAA token storage');
+    errors.push('IMMUDB_NOT_INITIALIZED');
+    return { stored: [], errors };
+  }
+
+  const tokens = Array.isArray(maaTokens) ? maaTokens : [];
+  if (!keycloakToken || !userId || tokens.length === 0) {
+    errors.push('INVALID_INPUT');
+    return { stored: [], errors };
+  }
+
+  const timestamp = Date.now();
+  const sessionHash = createHash('sha256').update(keycloakToken).digest('hex');
+
+  const stored = [];
+
+  for (const maaToken of tokens) {
+    if (!maaToken) {
+      continue;
+    }
+
+    const eventId = uuidv4();
+    const record = {
+      event_id: eventId,
+      event_type: 'MAA_TOKEN_RECEIVED',
+      user_id: userId,
+      session_hash: sessionHash,
+      timestamp,
+      occurred_at: new Date(timestamp).toISOString(),
+      keycloak_token: keycloakToken,
+      maa_token: maaToken,
+      metadata,
+    };
+
+    try {
+      const recordJson = JSON.stringify(record);
+
+      await client.set({ key: `maa:${eventId}`, value: recordJson });
+      await client.set({ key: `maa:user:${userId}:${eventId}`, value: recordJson });
+      await client.set({ key: `maa:session:${sessionHash}:${eventId}`, value: recordJson });
+      await client.set({ key: `maa:time:${timestamp}:${eventId}`, value: recordJson });
+      stored.push(record);
+    } catch (err) {
+      console.error(`✗ Failed to store MAA token record: ${err.message}`);
+      errors.push(err.message);
+    }
+  }
+
+  return { stored, errors };
 }

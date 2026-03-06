@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "nodemon server.js",
+    "dev": "nodemon src/server.js",
     "start": "node src/server.js",
     "test:e2e": "node test-e2e.js",
+    "test:maa": "node test-maa-tokens.js",
     "test:audit": "node verify-audit.js",
     "test:immudb": "node test-immudb-audit.js",
     "setup:immudb": "node setup-immudb.mjs",

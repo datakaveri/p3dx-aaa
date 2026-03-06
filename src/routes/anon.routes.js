@@ -8,7 +8,7 @@ import {
 } from '../services/keycloak.service.js';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import { requireRole } from '../middlewares/role.middleware.js';
-import { logAuditEvent } from '../services/immudb.service.js';
+import { logAuditEvent, storeMaaTokens } from '../services/immudb.service.js';
 
 
 
@@ -138,6 +138,125 @@ router.get(
         roles: req.user.realm_access.roles,
       },
     });
+  }
+);
+
+router.post(
+  '/maa-tokens',
+  verifyJWT,
+  requireRole('user'),
+  async (req, res, next) => {
+    try {
+      const authHeader = req.headers.authorization;
+      const keycloakToken = authHeader?.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+
+      if (!keycloakToken) {
+        return res.status(401).json({
+          status: 'FAILED',
+          error: 'MISSING_AUTH_TOKEN',
+        });
+      }
+
+      const contentType = (req.headers['content-type'] || '').toLowerCase();
+      let maaTokens = [];
+
+      if (contentType.includes('application/json')) {
+        let jsonBody = req.body;
+
+        if (typeof jsonBody === 'string') {
+          const trimmed = jsonBody.trim();
+          if (trimmed) {
+            try {
+              jsonBody = JSON.parse(trimmed);
+            } catch {
+              jsonBody = req.body;
+            }
+          }
+        }
+
+        if (Array.isArray(jsonBody?.jwts)) {
+          maaTokens = jsonBody.jwts;
+        } else if (typeof jsonBody?.jwts === 'string') {
+          maaTokens = [jsonBody.jwts];
+        } else if (Array.isArray(jsonBody?.maa_tokens)) {
+          maaTokens = jsonBody.maa_tokens;
+        } else if (typeof jsonBody?.maa_token === 'string') {
+          maaTokens = [jsonBody.maa_token];
+        } else if (typeof jsonBody?.tokens === 'string') {
+          maaTokens = [jsonBody.tokens];
+        }
+      } else {
+        const raw = typeof req.body === 'string' ? req.body : '';
+        const trimmed = raw.trim();
+        if (trimmed) {
+          if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+            try {
+              const parsed = JSON.parse(trimmed);
+              if (Array.isArray(parsed)) {
+                maaTokens = parsed;
+              }
+            } catch {
+              maaTokens = [];
+            }
+          }
+
+          if (maaTokens.length === 0) {
+            maaTokens = trimmed.split(/[\n,\s]+/).filter(Boolean);
+          }
+        }
+      }
+
+      if (!Array.isArray(maaTokens) || maaTokens.length === 0) {
+        await logAuditEvent('MAA_TOKENS_STORE_FAILED', req.user.sub, {
+          reason: 'MISSING_MAA_TOKENS',
+          ip: req.ip,
+          userAgent: req.get('user-agent'),
+          timestamp: new Date().toISOString(),
+        });
+
+        return res.status(400).json({
+          status: 'FAILED',
+          error: 'MISSING_MAA_TOKENS',
+        });
+      }
+
+      const stored = await storeMaaTokens({
+        keycloakToken,
+        userId: req.user.sub,
+        maaTokens,
+        metadata: {
+          ip: req.ip,
+          userAgent: req.get('user-agent'),
+          timestamp: new Date().toISOString(),
+          preferredUsername: req.user.preferred_username,
+        },
+      });
+
+      const storedCount = Array.isArray(stored?.stored) ? stored.stored.length : 0;
+
+      await logAuditEvent('MAA_TOKENS_STORED', req.user.sub, {
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        timestamp: new Date().toISOString(),
+        maaTokenCount: maaTokens.length,
+        storedCount,
+        storageErrorsCount: Array.isArray(stored?.errors) ? stored.errors.length : 0,
+      });
+
+      return res.json({
+        status: 'SUCCESS',
+        stored: storedCount,
+        errors: Array.isArray(stored?.errors) ? stored.errors : [],
+      });
+    } catch (err) {
+      await logAuditEvent('MAA_TOKENS_STORE_ERROR', req.user?.sub || 'unknown', {
+        error: err.message,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        timestamp: new Date().toISOString(),
+      });
+      next(err);
+    }
   }
 );
 

@@ -75,6 +75,9 @@ export async function verifyJWT(req, res, next) {
     return res.status(401).json({
       status: "FAILED",
       error: "INVALID_OR_EXPIRED_TOKEN",
+      ...(process.env.NODE_ENV === 'production'
+        ? {}
+        : { detail: err?.message || String(err) }),
     });
   }
 }
