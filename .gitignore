@@ -8,3 +8,9 @@ yarn-error.log*
 
 .DS_Store
 
+.env
+
+details.txt
+
+secrets.txt
+secrets*.txt

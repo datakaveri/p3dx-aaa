@@ -46,6 +46,53 @@ function sendKnownError(res, err) {
   return null;
 }
 
+router.post('/policy', verifyJWT, requireRole('user'), async (req, res, next) => {
+  try {
+    const roles = req.user?.realm_access?.roles || [];
+    if (!roles.includes('data-provider')) {
+      return res.status(403).json({ status: 'FAILED', error: 'INSUFFICIENT_ROLE' });
+    }
+
+    const apdBaseUrlRaw = process.env.APD_BASE_URL;
+    const apdBaseUrl = typeof apdBaseUrlRaw === 'string' ? apdBaseUrlRaw.trim() : '';
+    if (!apdBaseUrl) {
+      return res.status(503).json({ status: 'FAILED', error: 'APD_NOT_CONFIGURED' });
+    }
+
+    const url = apdBaseUrl.endsWith('/')
+      ? `${apdBaseUrl}api/v1/policy`
+      : `${apdBaseUrl}/api/v1/policy`;
+
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(req.body || {}),
+    });
+
+    const text = await upstream.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({
+        status: 'FAILED',
+        error: data?.message || data?.error || 'APD_POLICY_SUBMIT_FAILED',
+        ...(process.env.NODE_ENV === 'production' ? {} : { detail: data || text }),
+      });
+    }
+
+    return res.status(201).json({ status: 'SUCCESS', apd: data });
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.post('/role-requests', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {
     const roleName = req.body?.role || req.body?.role_name;

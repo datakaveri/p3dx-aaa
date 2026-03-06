@@ -21,6 +21,10 @@ anon-backend (Node.js/Express, VM, port 3000)
 Keycloak (VM, port 8080)
   -> PostgreSQL (VM local service, port 5432)
 
+Policy storage (optional local dev):
+
+anon-backend -> APD (Go) (VM local, port 8082)
+
 Audit logging:
 anon-backend -> immuDB (VM, port 3322)
 
@@ -31,10 +35,11 @@ anon-backend -> immuDB (VM, port 3322)
 ### VM-side ports
 
 - SSH: `22`
-- Keycloak: `8080` (binds to `0.0.0.0` in dev mode)
+- Keycloak: `8080` (dev mode typically binds to all interfaces)
 - anon-backend: `3000`
 - PostgreSQL (Keycloak DB): `5432` (local to VM)
 - immuDB: `3322`
+- APD (Go, local dev): `8082` (optional; used for policy submissions)
 
 ### Recommended access from a developer machine (Mac/Linux)
 
@@ -55,12 +60,6 @@ From your laptop:
 
 ```bash
 ssh azureuser@<VM_PUBLIC_IP>
-```
-
-Example (current VM):
-
-```bash
-ssh azureuser@20.193.132.42
 ```
 
 ---
@@ -174,7 +173,7 @@ Expected log hints:
 
 - PostgreSQL JDBC driver
 - `Profile dev activated`
-- `Listening on: http://0.0.0.0:8080`
+- `Listening on: http://<VM_HOST>:8080`
 
 ---
 
@@ -183,7 +182,7 @@ Expected log hints:
 SSH port forward:
 
 ```bash
-ssh -L 8181:localhost:8080 azureuser@20.193.132.42
+ssh -L 8181:localhost:8080 azureuser@<VM_PUBLIC_IP>
 ```
 
 Open:
@@ -194,11 +193,6 @@ Open:
 ### 6.1 Create initial admin user (first run)
 
 Keycloak will prompt you to create the first admin user.
-
-Known working credentials (current system state):
-
-- Admin username: `<KEYCLOAK_ADMIN_USER>`
-- Admin password: `<KEYCLOAK_ADMIN_PASSWORD>`
 
 ---
 
@@ -268,12 +262,6 @@ sudo docker exec -it immudb immuadmin database create anon_audit
 sudo docker exec -it immudb immuadmin user create anon_backend readwrite anon_audit
 ```
 
-Known working app user:
-
-- `anon_backend`
-- Password: `<IMMUDB_PASSWORD>`
-- Database: `anon_audit`
-
 ---
 
 ## 9) anon-backend setup
@@ -316,11 +304,91 @@ IMMUDB_ADMIN_PASSWORD=immudb
 IMMUDB_USER=anon_backend
 IMMUDB_PASSWORD=...
 IMMUDB_DATABASE=anon_audit
+
+APD_BASE_URL=http://localhost:8082
 ```
 
 Notes:
 
 - If you access Keycloak from your laptop via SSH tunnel, that affects your laptop’s browser URL, not the backend. The backend on the VM should still use `http://localhost:8080`.
+
+---
+
+## 9.5) APD (Go) local setup (for policy submissions)
+
+This project supports a Phase-0 policy push flow where the UI submits a policy to the backend, and the backend proxies it to APD:
+
+- Backend: `POST /p3dx/policy`
+- APD: `POST /api/v1/policy`
+
+### 9.5.1 Go version
+
+APD requires Go `1.22+`.
+
+### 9.5.2 Postgres (APD storage)
+
+APD requires a Postgres database and credentials (example values):
+
+- `DB_USER=apd`
+- `DB_PASSWORD=apdpass`
+- `DB_NAME=apd`
+- `DB_PORT=5432`
+
+Schema must be applied using `schema.sql` in the APD repo.
+
+### 9.5.3 Keys
+
+APD requires EC key material (P-256) for JWT and signing.
+
+Example paths:
+
+- `/home/azureuser/p3dx-apd/keys/jwt_private.pem`
+- `/home/azureuser/p3dx-apd/keys/jwt_public.pem`
+
+### 9.5.4 Run APD
+
+Example (as used during verification):
+
+```bash
+export PORT=8082
+
+export DB_HOST=localhost
+export DB_PORT=5432
+export DB_USER=apd
+export DB_PASSWORD=apdpass
+export DB_NAME=apd
+export DB_SSLMODE=disable
+
+export JWT_PRIVATE_KEY_PATH=/home/azureuser/p3dx-apd/keys/jwt_private.pem
+export JWT_PUBLIC_KEY_PATH=/home/azureuser/p3dx-apd/keys/jwt_public.pem
+export JWT_ISSUER=http://localhost:8082
+
+export TEE_ORCHESTRATOR_URL=http://localhost:9999
+export APD_BASE_URL=http://localhost:8082
+export APD_SIGNING_KEY_PATH=/home/azureuser/p3dx-apd/keys/jwt_private.pem
+
+go run ./cmd/server/main.go
+```
+
+Expected:
+
+- `APD server listening on :8082`
+
+### 9.5.5 Verify APD
+
+```bash
+curl -s http://localhost:8082/health
+```
+
+---
+
+## 12.6) Policy submission verification (APD)
+
+After submitting a policy via the UI, use the `policyId` to confirm APD stored it:
+
+```bash
+curl -s http://localhost:8082/api/v1/policy/<policyId>
+```
 
 ### 9.4 Start the backend
 
@@ -345,9 +413,65 @@ npm run dev
 
 Base URL: `http://<vm>:3000` (or `http://localhost:3000` if port-forwarded)
 
+### 10.1 Auth endpoints
+
 - `POST /anon/register`
 - `POST /anon/login`
 - `GET /anon/me` (protected; requires Bearer token + role `user`)
+
+### 10.2 P3DX endpoints (role requests + policies)
+
+Base path: `/p3dx`
+
+#### `POST /p3dx/policy`
+
+- **Purpose**
+  - UI submits an access policy; backend forwards it to APD.
+- **Auth**
+  - `Authorization: Bearer <Keycloak access token>`
+  - Requires Keycloak realm role: `data-provider`
+- **Backend config**
+  - `APD_BASE_URL` must be set (example: `http://localhost:8082`)
+- **Body (JSON)**
+  - Must match APD `ReceivePolicyBody`:
+
+```json
+{
+  "policyId": "policy-<uuid>",
+  "itemId": "ds-1",
+  "issuedBy": "<username>",
+  "rules": { "any": "json" },
+  "expiresAt": "2026-03-14T00:00:00.000Z"
+}
+```
+
+Notes:
+
+- `expiresAt` is optional.
+- `rules` is free-form JSON; APD stores it as-is.
+
+#### `POST /anon/maa-tokens`
+
+- **Purpose**
+  - UI submits one or more MAA tokens; backend verifies the Keycloak JWT and stores mappings in immuDB.
+- **Auth**
+  - `Authorization: Bearer <Keycloak access token>`
+- **Body (preferred)**: `application/json`
+
+Single token:
+
+```json
+{ "maa_token": "<MAA_JWT>" }
+```
+
+Multiple tokens:
+
+```json
+{ "maa_tokens": ["<MAA_JWT_1>", "<MAA_JWT_2>"] }
+```
+
+- **Body (alternate)**: `text/plain`
+  - Newline/comma/space separated tokens OR a JSON array string.
 
 ---
 
@@ -553,7 +677,7 @@ Important:
 Create the tunnel:
 
 ```bash
-ssh -L 3322:localhost:3322 azureuser@20.193.132.42
+ssh -L 3322:localhost:3322 azureuser@<VM_PUBLIC_IP>
 ```
 
 Then run immuclient locally:
@@ -632,3 +756,43 @@ npm start
 - Credentials in this document are current working values; rotate them for production.
 - Avoid exposing Keycloak/immuDB publicly; use SSH forwarding for admin access.
 - Consider storing secrets in a secrets manager for production.
+
+---
+
+## Appendix A) immuDB service API (developer reference)
+
+The immuDB integration lives in `src/services/immudb.service.js` and is used for immutable audit storage.
+
+### `initImmuDB()`
+
+- **Purpose**
+  - Initialize connection to immuDB at startup (called by `src/server.js` before `app.listen`).
+- **Reads env**
+  - `IMMUDB_HOST`, `IMMUDB_PORT`, `IMMUDB_USER`, `IMMUDB_PASSWORD`, `IMMUDB_DATABASE`
+- **Behavior**
+  - Connects + selects DB.
+  - If immuDB is unavailable, the backend continues running with console-only audit logging.
+
+### `logAuditEvent(eventType, subjectId, metadata = {})`
+
+- **Purpose**
+  - Persist an immutable audit event.
+- **Key patterns written**
+  - `audit:<eventId>`
+  - `audit:type:<eventType>:<eventId>`
+  - `audit:subject:<subjectId>:<eventId>`
+  - `audit:time:<timestamp>:<eventId>`
+- **Error handling**
+  - Safe fallback: should not crash request handling if immuDB is temporarily down.
+
+### `getAllAuditEvents()`
+
+- **Purpose**
+  - Retrieve all events by scanning `audit:` keys.
+- **Notes**
+  - Filters to canonical keys `audit:<uuid>`.
+
+### `getAuditEventsByType(eventType)`
+
+- **Purpose**
+  - Retrieve events by scanning `audit:type:<eventType>:` keys.
