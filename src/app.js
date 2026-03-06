@@ -5,18 +5,22 @@ import errorMiddleware from "./middlewares/error.middleware.js";
 
 const app = express();
 
+const corsOrigins = String(process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
 /**
  * CORS middleware
  * This automatically handles preflight (OPTIONS) correctly
  */
 app.use(
   cors({
-    origin: [
-      "https://spider.p3dx.iudx.org.in",
-      "http://localhost:5173",
-      "http://localhost:5174",
-      "https://login.p3dx.iudx.org.in",
-    ],
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (corsOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error("CORS: origin not allowed"));
+    },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })

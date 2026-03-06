@@ -59,14 +59,13 @@ Notes:
 
 ## 3) CORS
 
-CORS allowlist is configured in `src/app.js`.
+CORS allowlist is configured via environment variable (recommended).
 
-Allowed origins (as configured):
+- `CORS_ORIGINS` (comma-separated list of allowed browser origins)
 
-- `https://spider.p3dx.iudx.org.in`
-- `http://localhost:5173`
-- `http://localhost:5174`
-- `https://login.p3dx.iudx.org.in`
+Example (local dev):
+
+- `CORS_ORIGINS=http://localhost:****,http://localhost:****`
 
 Allowed headers:
 
