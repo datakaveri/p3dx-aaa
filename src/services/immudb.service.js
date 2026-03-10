@@ -287,3 +287,84 @@ export async function storeMaaTokens({ keycloakToken, userId, maaTokens, metadat
 export function getImmuDBClient() {
   return client;
 }
+
+export async function storeWorkloadContract({ contract, datasetId, applicationId, user, metadata = {} }) {
+  const errors = [];
+
+  if (!client) {
+    console.warn('⚠ immuDB not initialized, skipping workload contract storage');
+    errors.push('IMMUDB_NOT_INITIALIZED');
+    return { stored: null, errors };
+  }
+
+  const contractId = contract?.contract_id || contract?.contractId;
+  if (!contractId) {
+    errors.push('MISSING_CONTRACT_ID');
+    return { stored: null, errors };
+  }
+
+  const userSub = user?.sub || user?.id || user?.user_id || user?.preferred_username || 'unknown';
+  const userEmail = user?.email;
+  const timestamp = Date.now();
+
+  const contractJson = JSON.stringify(contract);
+  const contractHash = createHash('sha256').update(contractJson).digest('hex');
+
+  const record = {
+    event_id: uuidv4(),
+    event_type: 'WORKLOAD_CONTRACT_CREATED',
+    contract_id: contractId,
+    contract_hash: contractHash,
+    dataset_id: datasetId,
+    application_id: applicationId,
+    user_sub: userSub,
+    user_email: userEmail,
+    timestamp,
+    occurred_at: new Date(timestamp).toISOString(),
+    contract,
+    metadata,
+  };
+
+  try {
+    const recordJson = JSON.stringify(record);
+
+    await client.set({ key: `workload-contract:${contractId}`, value: recordJson });
+    await client.set({ key: `workload-contract:user:${userSub}:${contractId}`, value: recordJson });
+    await client.set({ key: `workload-contract:time:${timestamp}:${contractId}`, value: recordJson });
+    if (datasetId) {
+      await client.set({ key: `workload-contract:dataset:${datasetId}:${contractId}`, value: recordJson });
+    }
+    if (applicationId) {
+      await client.set({ key: `workload-contract:app:${applicationId}:${contractId}`, value: recordJson });
+    }
+
+    return { stored: record, errors };
+  } catch (err) {
+    console.error(`✗ Failed to store workload contract record: ${err.message}`);
+    errors.push(err.message);
+    return { stored: record, errors };
+  }
+}
+
+export async function getWorkloadContractById(contractId) {
+  if (!client) {
+    return null;
+  }
+
+  if (!contractId) {
+    return null;
+  }
+
+  try {
+    const resp = await client.get({ key: `workload-contract:${contractId}` });
+    const value = resp?.value ?? resp;
+    if (!value) {
+      return null;
+    }
+
+    const json = Buffer.isBuffer(value) ? value.toString('utf8') : String(value);
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}

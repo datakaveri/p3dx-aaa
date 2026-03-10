@@ -16,7 +16,7 @@ It is written so a teammate can reproduce the full environment from scratch.
 
 Frontend (React/Vite, local dev)
   -> HTTP JSON
-p3dx-aaa auth backend (Node.js/Express, VM, port 3000)
+p3dx-aaa auth backend (Node.js/Express, VM, port `<PORT>`)
   -> Keycloak Admin API + OIDC token endpoint
 Keycloak (VM, port 8080)
   -> PostgreSQL (VM local service, port 5432)
@@ -50,7 +50,7 @@ Use SSH port forwarding; do not expose admin services publicly.
 - immuDB:
   - Local `3322` -> VM `localhost:3322`
 - Optional backend:
-  - Local `3000` -> VM `localhost:3000`
+  - Local `<PORT>` -> VM `localhost:<PORT>`
 
 ---
 
@@ -288,7 +288,7 @@ You can start by copying `.env.example` to `.env`.
 Key variables:
 
 ```env
-PORT=3000
+PORT=3001
 
 KEYCLOAK_BASE_URL=http://localhost:8080
 KEYCLOAK_REALM=master
@@ -399,7 +399,7 @@ npm start
 Expected output:
 
 - `✓ immuDB connected and database selected`
-- `p3dx-aaa auth backend running on port 3000`
+- `p3dx-aaa auth backend running on port 3001`
 
 Development mode:
 
@@ -411,13 +411,13 @@ npm run dev
 
 ## 10) API endpoints
 
-Base URL: `http://<vm>:3000` (or `http://localhost:3000` if port-forwarded)
+Base URL: `http://<vm>:<PORT>` (or `http://localhost:<PORT>` if port-forwarded)
 
 ### 10.1 Auth endpoints
 
-- `POST /anon/register`
-- `POST /anon/login`
-- `GET /anon/me` (protected; requires Bearer token + role `user`)
+- `POST /p3dx/register`
+- `POST /p3dx/login`
+- `GET /p3dx/me` (protected; requires Bearer token + role `user`)
 
 ### 10.2 P3DX endpoints (role requests + policies)
 
@@ -450,7 +450,9 @@ Notes:
 - `expiresAt` is optional.
 - `rules` is free-form JSON; APD stores it as-is.
 
-#### `POST /anon/maa-tokens`
+#### `POST /p3dx/maa-tokens`
+
+Note: `/anon/*` is currently kept as a backward-compatible alias for `/p3dx/*`, but new clients should use `/p3dx`.
 
 - **Purpose**
   - UI submits one or more MAA tokens; backend verifies the Keycloak JWT and stores mappings in immuDB.
@@ -624,6 +626,8 @@ npm run test:audit
   - Implements the Express server + Keycloak integration + immuDB audit logging
 - **How to start**
 
+Run these commands from the backend repo root (commonly `~/p3dx-aaa`). If you checked out a working copy named `p3dx-aaa-local` on this branch, use that directory instead.
+
 ```bash
 cd ~/p3dx-aaa
 npm start
@@ -645,6 +649,32 @@ npm start
   - Runs `node test-immudb-audit.js`
 - **`npm run test:audit`**
   - Runs `node verify-audit.js`
+
+---
+
+## 12.5 Workload contract (Run Workload)
+
+When a user clicks "Run Workload" in the UI, the backend creates a workload contract using the vendored Go generator, generates a user-side consent proof/signature, and persists the signed contract + consent metadata to immuDB.
+
+### API endpoints
+
+- `POST /p3dx/workloads/run`
+  - **Auth**: requires Keycloak JWT (`Authorization: Bearer ...`) and `user` role
+  - **Body**: `{ "datasetId": "...", "applicationId": "..." }`
+  - **Response**: `{ status: "SUCCESS", contract: { ... } }`
+- `GET /p3dx/workloads/contracts/:contractId`
+  - **Auth**: requires Keycloak JWT and `user` role
+  - **Response**: `{ status: "SUCCESS", record: { ... } }`
+
+### Required backend env vars
+
+Add these to your backend `.env` (do not commit secrets):
+
+- `CONTRACT_SERVER_SECRET`
+  - Strong random secret used by the contract generator to produce the user-side consent proof/signature.
+- `CONTRACT_GEN_BIN`
+  - Path to the built Go binary (recommended under systemd).
+  - If empty, the backend falls back to `go run .` in `./contract-gen` (dev mode).
 
 ---
 
@@ -739,7 +769,7 @@ bin/kc.sh start-dev \
 ### Start immuDB
 
 ```bash
-sudo docker start immudb
+/snap/bin/docker start immudb
 ```
 
 ### Start backend
@@ -756,6 +786,143 @@ npm start
 - Credentials in this document are current working values; rotate them for production.
 - Avoid exposing Keycloak/immuDB publicly; use SSH forwarding for admin access.
 - Consider storing secrets in a secrets manager for production.
+
+---
+
+## 17) Optional: run components with systemd (.service units)
+
+If you are repeatedly starting/stopping services on the VM, you can use systemd unit files.
+
+This repo provides templates under `systemd/`:
+
+- `systemd/keycloak-dev.service`
+- `systemd/immudb-container.service`
+- `systemd/p3dx-aaa-auth-backend.service`
+
+These units deliberately do **not** embed secrets. They reference local `EnvironmentFile=` paths.
+
+Notes:
+
+- This VM uses Docker installed via snap, so the Docker daemon service is `snap.docker.dockerd.service` and the Docker CLI is typically `/snap/bin/docker`.
+- `immudb-container.service` intentionally wraps Docker commands using `/bin/bash -lc` (systemd does not interpret pipes like `|` unless run through a shell).
+
+### 17.1 Install unit files
+
+Copy the unit files into systemd:
+
+```bash
+sudo cp systemd/*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
+### 17.2 Create Keycloak environment file
+
+Create `/etc/p3dx-aaa/keycloak.env` (do not commit; restrict permissions):
+
+```bash
+sudo mkdir -p /etc/p3dx-aaa
+sudo nano /etc/p3dx-aaa/keycloak.env
+sudo chmod 600 /etc/p3dx-aaa/keycloak.env
+```
+
+Example keys (fill values locally):
+
+```bash
+KC_DB_URL=jdbc:postgresql://localhost:5432/keycloak
+KC_DB_USERNAME=keycloak_admin
+KC_DB_PASSWORD=<KEYCLOAK_DB_PASSWORD>
+```
+
+### 17.3 Enable and start
+
+```bash
+sudo systemctl enable --now immudb-container.service
+sudo systemctl enable --now keycloak-dev.service
+sudo systemctl enable --now p3dx-aaa-auth-backend.service
+```
+
+Start (without enabling on boot):
+
+```bash
+sudo systemctl start immudb-container.service
+sudo systemctl start keycloak-dev.service
+sudo systemctl start p3dx-aaa-auth-backend.service
+```
+
+Stop (keeps enabled for next boot):
+
+```bash
+sudo systemctl stop p3dx-aaa-auth-backend.service
+sudo systemctl stop keycloak-dev.service
+sudo systemctl stop immudb-container.service
+```
+
+Disable and stop (won't start on boot):
+
+```bash
+sudo systemctl disable --now p3dx-aaa-auth-backend.service
+sudo systemctl disable --now keycloak-dev.service
+sudo systemctl disable --now immudb-container.service
+```
+
+Check status/logs:
+
+```bash
+sudo systemctl status p3dx-aaa-auth-backend.service
+sudo journalctl -u p3dx-aaa-auth-backend.service -f
+```
+
+---
+
+## 18) Checking services from a macOS laptop (SSH port forwarding)
+
+If you want to access Keycloak and the backend from your laptop without exposing VM ports publicly, use SSH port forwarding.
+
+### 18.1 SSH config (recommended)
+
+Add a host entry to `~/.ssh/config` on your Mac:
+
+```sshconfig
+Host p3dx-auth-vm
+  HostName <VM_PUBLIC_IP>
+  User azureuser
+
+  ServerAliveInterval 30
+  ServerAliveCountMax 3
+
+  LocalForward 8181 localhost:8080
+  LocalForward 3001 localhost:3001
+  LocalForward 3322 localhost:3322
+```
+
+### 18.2 Start the tunnel (auto-reconnect)
+
+Install `autossh` on macOS (Homebrew) and run:
+
+```bash
+autossh -M 0 -N p3dx-auth-vm
+```
+
+Notes:
+
+- If you already have an IDE-managed SSH session (Remote SSH / port forwarding), the local ports may already be bound (8181/3001/3322). In that case, you can use the forwarded ports directly and you do not need `autossh`.
+- If your `~/.ssh/config` includes `LocalForward` entries and you want to run `autossh` on alternate local ports, pass `-o ClearAllForwardings=yes` and specify only the `-L` forwards you want.
+
+With the tunnel running, you can use:
+
+- Keycloak UI: `http://localhost:8181/admin`
+- Backend API: `http://localhost:3001`
+
+Example alternate ports (avoids conflicts):
+
+```bash
+autossh -M 0 -N \
+  -o ClearAllForwardings=yes \
+  -L 8182:localhost:8080 \
+  -L 3002:localhost:3001 \
+  -L 3323:localhost:3322 \
+  p3dx-auth-vm
+```
 
 ---
 
@@ -784,6 +951,28 @@ The immuDB integration lives in `src/services/immudb.service.js` and is used for
   - `audit:time:<timestamp>:<eventId>`
 - **Error handling**
   - Safe fallback: should not crash request handling if immuDB is temporarily down.
+
+### `storeWorkloadContract({ contract, datasetId, applicationId, user, metadata = {} })`
+
+- **Purpose**
+  - Persist the signed workload contract + consent metadata when a user clicks "Run Workload".
+- **Call site**
+  - `POST /p3dx/workloads/run`
+- **Key patterns written**
+  - `workload-contract:<contractId>`
+  - `workload-contract:user:<userSub>:<contractId>`
+  - `workload-contract:time:<timestamp>:<contractId>`
+  - `workload-contract:dataset:<datasetId>:<contractId>`
+  - `workload-contract:app:<applicationId>:<contractId>`
+- **Notes**
+  - The stored record includes: contract JSON, a sha256 `contract_hash`, user identity from the verified JWT, and a consent timestamp.
+
+### `getWorkloadContractById(contractId)`
+
+- **Purpose**
+  - Retrieve a stored workload contract record by `contractId`.
+- **Call site**
+  - `GET /p3dx/workloads/contracts/:contractId`
 
 ### `getAllAuditEvents()`
 

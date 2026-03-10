@@ -6,7 +6,7 @@
 import http from 'http';
 import https from 'https';
 
-const BASE_URL = 'http://localhost:3000';
+const BASE_URL = 'http://localhost:3001';
 
 // Color codes for console output
 const colors = {
@@ -83,7 +83,7 @@ async function runTests() {
     // 1. REGISTRATION TEST
     // ============================================
     log('TEST-1', 'Registering new user...', colors.blue);
-    const registerRes = await request('POST', '/anon/register', testUser);
+    const registerRes = await request('POST', '/p3dx/register', testUser);
 
     if (registerRes.status === 201 && registerRes.body.status === 'SUCCESS') {
       log('✓ PASS', `User registered: ${testUser.username}`, colors.green);
@@ -99,7 +99,7 @@ async function runTests() {
     // 2. LOGIN TEST
     // ============================================
     log('TEST-2', 'Logging in user...', colors.blue);
-    const loginRes = await request('POST', '/anon/login', {
+    const loginRes = await request('POST', '/p3dx/login', {
       username: testUser.username,
       password: testUser.password,
     });
@@ -125,7 +125,7 @@ async function runTests() {
     log('TEST-3', 'Accessing dashboard (/me endpoint)...', colors.blue);
 
     const meRes = await new Promise((resolve, reject) => {
-      const url = new URL('/anon/me', BASE_URL);
+      const url = new URL('/p3dx/me', BASE_URL);
       const options = {
         method: 'GET',
         headers: {

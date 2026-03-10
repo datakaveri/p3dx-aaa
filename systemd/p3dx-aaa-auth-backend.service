@@ -1,0 +1,17 @@
+[Unit]
+Description=p3dx-aaa auth backend
+After=network.target immudb-container.service keycloak-dev.service
+Wants=immudb-container.service keycloak-dev.service
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/p3dx-aaa-local
+EnvironmentFile=/home/azureuser/p3dx-aaa-local/.env
+Environment=NODE_ENV=production
+ExecStart=node /home/azureuser/p3dx-aaa-local/src/server.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

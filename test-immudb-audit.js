@@ -11,7 +11,7 @@ import http from 'http';
 
 const ImmudbClient = pkg.default;
 
-const BASE_URL = 'http://localhost:3000';
+const BASE_URL = 'http://localhost:3001';
 
 // Color codes
 const colors = {
@@ -151,7 +151,7 @@ async function runTests() {
     // 2. REGISTER USER (logs USER_REGISTER_SUCCESS and USER_REGISTER_FAILED if test)
     // ============================================
     log('STEP-2', 'Testing registration endpoint (should log USER_REGISTER_SUCCESS)', colors.blue);
-    const registerRes = await request('POST', '/anon/register', testUser);
+    const registerRes = await request('POST', '/p3dx/register', testUser);
 
     if (registerRes.status === 201) {
       log('✓ PASS', `User registered: ${testUser.username}`, colors.green);
@@ -165,7 +165,7 @@ async function runTests() {
     // 3. TEST DUPLICATE REGISTRATION (logs USER_REGISTER_FAILED)
     // ============================================
     log('STEP-3', 'Testing duplicate registration (should log USER_REGISTER_FAILED)', colors.blue);
-    const dupRegisterRes = await request('POST', '/anon/register', testUser);
+    const dupRegisterRes = await request('POST', '/p3dx/register', testUser);
 
     if (dupRegisterRes.status === 409) {
       log('✓ PASS', `Duplicate registration blocked (as expected)`, colors.green);
@@ -178,7 +178,7 @@ async function runTests() {
     // 4. LOGIN USER (logs USER_LOGIN_SUCCESS)
     // ============================================
     log('STEP-4', 'Testing login endpoint (should log USER_LOGIN_SUCCESS)', colors.blue);
-    const loginRes = await request('POST', '/anon/login', {
+    const loginRes = await request('POST', '/p3dx/login', {
       username: testUser.username,
       password: testUser.password,
     });
@@ -196,7 +196,7 @@ async function runTests() {
     // 5. TEST INVALID LOGIN (logs USER_LOGIN_FAILED)
     // ============================================
     log('STEP-5', 'Testing invalid login (should log USER_LOGIN_FAILED)', colors.blue);
-    const invalidLoginRes = await request('POST', '/anon/login', {
+    const invalidLoginRes = await request('POST', '/p3dx/login', {
       username: testUser.username,
       password: 'WrongPassword123!',
     });
@@ -212,7 +212,7 @@ async function runTests() {
     // 6. ACCESS PROTECTED ENDPOINT (logs USER_PROFILE_ACCESS)
     // ============================================
     log('STEP-6', 'Accessing protected endpoint (should log USER_PROFILE_ACCESS)', colors.blue);
-    const meRes = await request('GET', '/anon/me', null, accessToken);
+    const meRes = await request('GET', '/p3dx/me', null, accessToken);
 
     if (meRes.status === 200) {
       log('✓ PASS', `Profile accessed with valid JWT`, colors.green);
@@ -226,7 +226,7 @@ async function runTests() {
     // 7. TEST MISSING TOKEN (logs JWT_VERIFY_FAILED)
     // ============================================
     log('STEP-7', 'Testing missing token (should log JWT_VERIFY_FAILED)', colors.blue);
-    const noTokenRes = await request('GET', '/anon/me');
+    const noTokenRes = await request('GET', '/p3dx/me');
 
     if (noTokenRes.status === 401) {
       log('✓ PASS', `Missing token rejected (as expected)`, colors.green);

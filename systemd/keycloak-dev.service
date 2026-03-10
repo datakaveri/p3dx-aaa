@@ -1,0 +1,20 @@
+[Unit]
+Description=Keycloak (dev mode)
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=azureuser
+WorkingDirectory=/home/azureuser/keycloak-26.4.7
+EnvironmentFile=/etc/p3dx-aaa/keycloak.env
+ExecStart=/home/azureuser/keycloak-26.4.7/bin/kc.sh start-dev \
+  --db=postgres \
+  --db-url=${KC_DB_URL} \
+  --db-username=${KC_DB_USERNAME} \
+  --db-password=${KC_DB_PASSWORD}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

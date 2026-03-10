@@ -3,7 +3,7 @@ import axios from 'axios';
 import pkg from 'immudb-node';
 
 function getBaseUrl() {
-  return process.env.BASE_URL || 'http://localhost:3000';
+  return process.env.BASE_URL || 'http://localhost:3001';
 }
 
 function getUsername() {
@@ -95,7 +95,7 @@ async function main() {
     let loginRes;
     try {
       loginRes = await axios.post(
-        `${baseUrl}/anon/login`,
+        `${baseUrl}/p3dx/login`,
         { username, password },
         { headers: { 'Content-Type': 'application/json' } }
       );
@@ -107,7 +107,7 @@ async function main() {
         console.log('[test:maa] Login failed; attempting auto-register...');
 
         await axios.post(
-          `${baseUrl}/anon/register`,
+          `${baseUrl}/p3dx/register`,
           {
             username,
             email: `${username}@example.com`,
@@ -121,7 +121,7 @@ async function main() {
         console.log('[test:maa] Register OK; retrying login...');
 
         loginRes = await axios.post(
-          `${baseUrl}/anon/login`,
+          `${baseUrl}/p3dx/login`,
           { username, password },
           { headers: { 'Content-Type': 'application/json' } }
         );
@@ -140,7 +140,7 @@ async function main() {
 
     const submitRes = submitMode === 'text'
       ? await axios.post(
-        `${baseUrl}/anon/maa-tokens`,
+        `${baseUrl}/p3dx/maa-tokens`,
         `${maaTokens.join('\n')}\n`,
         {
           headers: {
@@ -150,7 +150,7 @@ async function main() {
         }
       )
       : await axios.post(
-        `${baseUrl}/anon/maa-tokens`,
+        `${baseUrl}/p3dx/maa-tokens`,
         { maa_tokens: maaTokens },
         {
           headers: {
@@ -160,13 +160,13 @@ async function main() {
         }
       );
 
-    console.log('[test:maa] /anon/maa-tokens response:', submitRes.data);
+    console.log('[test:maa] /p3dx/maa-tokens response:', submitRes.data);
 
-    const meRes = await axios.get(`${baseUrl}/anon/me`, {
+    const meRes = await axios.get(`${baseUrl}/p3dx/me`, {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
 
-    console.log('[test:maa] /anon/me response:', meRes.data);
+    console.log('[test:maa] /p3dx/me response:', meRes.data);
 
     await verifyImmuDbMaaKeys();
 

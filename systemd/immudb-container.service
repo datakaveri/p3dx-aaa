@@ -1,0 +1,14 @@
+[Unit]
+Description=immuDB Docker container
+After=snap.docker.dockerd.service network.target
+Requires=snap.docker.dockerd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/bash -lc "/snap/bin/docker ps -a --format '{{.Names}}' | /usr/bin/grep -qx immudb"
+ExecStart=/bin/bash -lc "/snap/bin/docker start immudb || true"
+ExecStop=/snap/bin/docker stop immudb
+
+[Install]
+WantedBy=multi-user.target
