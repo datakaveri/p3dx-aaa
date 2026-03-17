@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { createHash } from 'node:crypto';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import { requireAnyRole, requireRole } from '../middlewares/role.middleware.js';
 import {
@@ -18,8 +19,24 @@ import {
   decideRoleRequest,
 } from '../services/roleRequests.service.js';
 import { createWorkloadContract } from '../services/contractGen.service.js';
+import { sendContractToTop } from '../services/top.service.js';
 
 const router = Router();
+
+function requireTopApiKey(req, res, next) {
+  const expectedRaw = process.env.TOP_BACKEND_API_KEY;
+  const expected = typeof expectedRaw === 'string' ? expectedRaw.trim() : '';
+  if (!expected) {
+    return res.status(503).json({ status: 'FAILED', error: 'TOP_BACKEND_API_KEY_NOT_CONFIGURED' });
+  }
+
+  const provided = String(req.get('x-api-key') || '').trim();
+  if (!provided || provided !== expected) {
+    return res.status(403).json({ status: 'FAILED', error: 'FORBIDDEN' });
+  }
+
+  next();
+}
 
 function sendKnownError(res, err) {
   const msg = err?.message;
@@ -175,6 +192,8 @@ router.post('/workloads/run', verifyJWT, requireRole('user'), async (req, res, n
       return res.status(401).json({ status: 'FAILED', error: 'MISSING_AUTH_TOKEN' });
     }
 
+    const tokenFingerprint = createHash('sha256').update(keycloakToken).digest('hex');
+
     const datasetId = req.body?.datasetId || req.body?.dataset;
     const applicationId = req.body?.applicationId || req.body?.application;
 
@@ -196,14 +215,92 @@ router.post('/workloads/run', verifyJWT, requireRole('user'), async (req, res, n
       metadata: {
         ip: req.ip,
         userAgent: req.get('user-agent'),
+        token_fingerprint: tokenFingerprint,
       },
     });
 
-    return res.status(201).json({ status: 'SUCCESS', contract });
+    let topResult = null;
+    try {
+      topResult = await sendContractToTop({
+        contract,
+        jwt: keycloakToken,
+        datasetId,
+        applicationId,
+        user: req.user,
+      });
+
+      const requiredRaw = process.env.TOP_REQUIRED;
+      const required = typeof requiredRaw === 'string' ? requiredRaw.trim().toLowerCase() : 'false';
+      const requiredBool = required === 'true' || required === '1' || required === 'yes';
+      if (requiredBool && topResult?.skipped !== true && topResult?.sent !== true) {
+        return res.status(502).json({
+          status: 'FAILED',
+          error: 'TOP_SUBMISSION_FAILED',
+          top: topResult,
+        });
+      }
+    } catch (err) {
+      const requiredRaw = process.env.TOP_REQUIRED;
+      const required = typeof requiredRaw === 'string' ? requiredRaw.trim().toLowerCase() : 'false';
+      const requiredBool = required === 'true' || required === '1' || required === 'yes';
+
+      topResult = {
+        sent: false,
+        skipped: false,
+        error: err?.message || 'TOP_SUBMISSION_ERROR',
+      };
+
+      if (requiredBool) {
+        return res.status(502).json({
+          status: 'FAILED',
+          error: 'TOP_SUBMISSION_FAILED',
+          top: topResult,
+        });
+      }
+    }
+
+    return res.status(201).json({ status: 'SUCCESS', contract, top: topResult });
   } catch (err) {
     next(err);
   }
 });
+
+// TOP -> backend: verify that the access token TOP received matches the token used
+// by the user when the workload contract was created.
+router.post(
+  '/workloads/contracts/:contractId/token-verify',
+  requireTopApiKey,
+  async (req, res, next) => {
+    try {
+      const { contractId } = req.params;
+      const record = await getWorkloadContractById(contractId);
+
+      if (!record) {
+        return res.status(404).json({ status: 'FAILED', error: 'CONTRACT_NOT_FOUND' });
+      }
+
+      const expected =
+        record?.metadata?.token_fingerprint ||
+        record?.stored?.metadata?.token_fingerprint ||
+        record?.stored?.metadata?.tokenFingerprint ||
+        record?.token_fingerprint;
+
+      if (!expected) {
+        return res.status(409).json({ status: 'FAILED', error: 'TOKEN_FINGERPRINT_NOT_AVAILABLE' });
+      }
+
+      const provided = String(req.body?.token_fingerprint || req.body?.tokenFingerprint || '').trim();
+      if (!provided) {
+        return res.status(400).json({ status: 'FAILED', error: 'MISSING_TOKEN_FINGERPRINT' });
+      }
+
+      const match = provided === expected;
+      return res.status(200).json({ status: 'SUCCESS', match });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 router.get('/workloads/contracts/:contractId', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {

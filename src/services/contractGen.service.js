@@ -68,10 +68,21 @@ export async function createWorkloadContract({ jwt, datasetId, applicationId }) 
   const contractGenBinRaw = process.env.CONTRACT_GEN_BIN;
   const contractGenBin = typeof contractGenBinRaw === 'string' ? contractGenBinRaw.trim() : '';
 
+  let overrides = undefined;
+  const overridesRaw = process.env.CONTRACT_OVERRIDES_JSON;
+  if (typeof overridesRaw === 'string' && overridesRaw.trim()) {
+    try {
+      overrides = JSON.parse(overridesRaw);
+    } catch {
+      overrides = undefined;
+    }
+  }
+
   const inputJson = {
     jwt,
     datasetId,
     applicationId,
+    ...(overrides ? { overrides } : {}),
   };
 
   if (contractGenBin) {

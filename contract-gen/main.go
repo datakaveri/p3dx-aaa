@@ -24,9 +24,23 @@ type jwtPayload struct {
 }
 
 type input struct {
-	JWT          string `json:"jwt"`
-	DatasetID    string `json:"datasetId"`
-	ApplicationID string `json:"applicationId"`
+	JWT           string     `json:"jwt"`
+	DatasetID     string     `json:"datasetId"`
+	ApplicationID string     `json:"applicationId"`
+	Overrides     *overrides `json:"overrides,omitempty"`
+}
+
+type overrides struct {
+	ContractID               *string                            `json:"contract_id,omitempty"`
+	Version                  *int                               `json:"version,omitempty"`
+	Description              *string                            `json:"description,omitempty"`
+	Lifecycle                *contract.Lifecycle                `json:"lifecycle,omitempty"`
+	ExecutionType            *string                            `json:"execution_type,omitempty"`
+	ExecutionPlatform        *string                            `json:"execution_platform,omitempty"`
+	Parties                  *contract.Parties                  `json:"parties,omitempty"`
+	DataProviderTerms        *contract.DataProviderTerms        `json:"data_provider_terms,omitempty"`
+	ApplicationProviderTerms *contract.ApplicationProviderTerms `json:"application_provider_terms,omitempty"`
+	ConsumerTerms            *contract.ConsumerTerms            `json:"consumer_terms,omitempty"`
 }
 
 func extractClaims(jwt string) (contract.KCClaims, error) {
@@ -176,6 +190,39 @@ func main() {
 			},
 			DataRetention: "DELETE_AFTER_EXECUTION",
 		},
+	}
+
+	if in.Overrides != nil {
+		if in.Overrides.ContractID != nil && strings.TrimSpace(*in.Overrides.ContractID) != "" {
+			c.ContractID = strings.TrimSpace(*in.Overrides.ContractID)
+		}
+		if in.Overrides.Version != nil {
+			c.Version = *in.Overrides.Version
+		}
+		if in.Overrides.Description != nil {
+			c.Description = *in.Overrides.Description
+		}
+		if in.Overrides.Lifecycle != nil {
+			c.Lifecycle = *in.Overrides.Lifecycle
+		}
+		if in.Overrides.ExecutionType != nil {
+			c.ExecutionType = *in.Overrides.ExecutionType
+		}
+		if in.Overrides.ExecutionPlatform != nil {
+			c.ExecutionPlatform = *in.Overrides.ExecutionPlatform
+		}
+		if in.Overrides.Parties != nil {
+			c.Parties = *in.Overrides.Parties
+		}
+		if in.Overrides.DataProviderTerms != nil {
+			c.DataProviderTerms = *in.Overrides.DataProviderTerms
+		}
+		if in.Overrides.ApplicationProviderTerms != nil {
+			c.ApplicationProviderTerms = *in.Overrides.ApplicationProviderTerms
+		}
+		if in.Overrides.ConsumerTerms != nil {
+			c.ConsumerTerms = *in.Overrides.ConsumerTerms
+		}
 	}
 
 	if err := contract.SignWithKeycloakSession(&c, claims, secret); err != nil {

@@ -6,6 +6,7 @@ This document describes the complete end-to-end setup for:
 - PostgreSQL (Keycloak internal DB) running locally on the VM
 - p3dx-aaa auth backend (Node.js/Express) running on the VM
 - immuDB (audit ledger) running on the VM (Docker)
+- TOP (TEE Orchestrator Protocol) running locally for POC (Go, port 8085)
 - Optional: React/Vite frontend running on a developer laptop
 
 It is written so a teammate can reproduce the full environment from scratch.
@@ -20,6 +21,11 @@ p3dx-aaa auth backend (Node.js/Express, VM, port `<PORT>`)
   -> Keycloak Admin API + OIDC token endpoint
 Keycloak (VM, port 8080)
   -> PostgreSQL (VM local service, port 5432)
+
+Workload orchestration (POC):
+
+p3dx-aaa auth backend -> TOP (Go) (VM local, port 8085)
+  -> TOP verifies user token fingerprint with backend and stores contract
 
 Policy storage (optional local dev):
 
@@ -36,10 +42,11 @@ p3dx-aaa auth backend -> immuDB (VM, port 3322)
 
 - SSH: `22`
 - Keycloak: `8080` (dev mode typically binds to all interfaces)
-- p3dx-aaa auth backend: `3000`
+- p3dx-aaa auth backend: `3001`
 - PostgreSQL (Keycloak DB): `5432` (local to VM)
 - immuDB: `3322`
 - APD (Go, local dev): `8082` (optional; used for policy submissions)
+- TOP (Go, local dev): `8085` (optional; contract storage + token verification)
 
 ### Recommended access from a developer machine (Mac/Linux)
 
@@ -367,12 +374,21 @@ export TEE_ORCHESTRATOR_URL=http://localhost:9999
 export APD_BASE_URL=http://localhost:8082
 export APD_SIGNING_KEY_PATH=/home/azureuser/p3dx-apd/keys/jwt_private.pem
 
+# Optional (POC): dump every received policy payload into a new JSON file
+export APD_POLICY_DUMP_DIR=/home/azureuser/p3dx-apd/policies
+
 go run ./cmd/server/main.go
 ```
 
 Expected:
 
 - `APD server listening on :8082`
+
+Policy dump behavior (POC):
+
+- If `APD_POLICY_DUMP_DIR` is set, every `POST /api/v1/policy` will create a new file:
+  - `<policyId>_<timestamp>.json`
+- This is best-effort and does not fail the request if file write fails.
 
 ### 9.5.5 Verify APD
 
@@ -661,7 +677,16 @@ When a user clicks "Run Workload" in the UI, the backend creates a workload cont
 - `POST /p3dx/workloads/run`
   - **Auth**: requires Keycloak JWT (`Authorization: Bearer ...`) and `user` role
   - **Body**: `{ "datasetId": "...", "applicationId": "..." }`
-  - **Response**: `{ status: "SUCCESS", contract: { ... } }`
+  - **Response**: `{ status: "SUCCESS", contract: { ... }, top: { ... } }`
+  - **Behavior**
+    - Generates a signed workload contract via the Go contract generator.
+    - Stores the contract + consent metadata in immuDB.
+    - Optionally submits the generated contract to TOP (TEE Orchestration component) if enabled via env.
+      - **TOP endpoint**: `POST ${TOP_BASE_URL}${TOP_CONTRACT_ENDPOINT}` (default `/contract`)
+      - **Auth**: passes the same user JWT as `Authorization: Bearer ...`
+      - **Payload**
+        - If `TOP_PAYLOAD_MODE=raw`: sends the generated contract JSON as-is.
+        - If `TOP_PAYLOAD_MODE=wrapper` (default): sends `{ "access_token": "...", "signature": "...", "contract": { ... } }`.
 - `GET /p3dx/workloads/contracts/:contractId`
   - **Auth**: requires Keycloak JWT and `user` role
   - **Response**: `{ status: "SUCCESS", record: { ... } }`
@@ -672,9 +697,66 @@ Add these to your backend `.env` (do not commit secrets):
 
 - `CONTRACT_SERVER_SECRET`
   - Strong random secret used by the contract generator to produce the user-side consent proof/signature.
+
+Optional contract generation env vars:
+
 - `CONTRACT_GEN_BIN`
   - Path to the built Go binary (recommended under systemd).
   - If empty, the backend falls back to `go run .` in `./contract-gen` (dev mode).
+- `CONTRACT_OVERRIDES_JSON`
+  - JSON string that is passed to the generator as `overrides` and merged over the generator defaults.
+  - Use this to inject real dataset/app/provider metadata (names, ids, urls, hashes, etc.) without changing Go code.
+
+Optional TOP integration env vars (see `.env.example`):
+
+- `TOP_ENABLED=true`
+- `TOP_BASE_URL` (example: `http://localhost:8085`)
+- `TOP_CONTRACT_ENDPOINT` (default: `/contract`)
+- `TOP_PAYLOAD_MODE` (default: `wrapper`)
+- `TOP_AUTH_MODE=bearer`
+- `TOP_REQUIRED=true` to fail `POST /p3dx/workloads/run` if TOP submission fails
+
+TOP token consistency verification (TOP -> backend):
+
+- Backend stores a `sha256` fingerprint of the user access token used to create the contract.
+- TOP computes the same fingerprint for the token it received and verifies it with:
+  - `POST /p3dx/workloads/contracts/:contractId/token-verify`
+  - Header: `X-API-Key: <TOP_BACKEND_API_KEY>`
+  - Body: `{ "token_fingerprint": "<sha256 hex>" }`
+- Backend replies `{ status: "SUCCESS", match: true|false }`.
+
+Env:
+
+- `TOP_BACKEND_API_KEY` (required to enable the verification endpoint)
+
+TOP runtime configuration (POC):
+
+- TOP is a separate Go project (in this workspace under `~/Top`).
+- TOP loads environment from a local `.env` file via `godotenv.Load()` in `Top/main.go`.
+
+Create `~/Top/.env` (do not commit secrets):
+
+```env
+PORT=8085
+
+# Backend base URL reachable from TOP
+BACKEND_URL=http://localhost:3001
+
+# Must match backend TOP_BACKEND_API_KEY
+BACKEND_API_KEY=<same value as TOP_BACKEND_API_KEY>
+```
+
+Run TOP:
+
+```bash
+cd ~/Top
+go run .
+```
+
+Strict behavior:
+
+- If TOP cannot reach backend token verification endpoint or `match=false`, TOP rejects contract ingestion.
+- If backend has `TOP_REQUIRED=true`, then `POST /p3dx/workloads/run` fails with `502 TOP_SUBMISSION_FAILED`.
 
 ---
 
@@ -739,6 +821,27 @@ scan audit:
 - Confirm user exists in Keycloak
 - Confirm client `anon-backend` has Direct Access Grants enabled
 - Confirm backend `.env` has correct client secret
+
+### 14.4 Run Workload returns 502 TOP_SUBMISSION_FAILED
+
+This means backend could not successfully submit the contract to TOP, and `TOP_REQUIRED=true` is enabled.
+
+Checklist:
+
+- Ensure TOP is running and listening on `TOP_BASE_URL`.
+- Ensure TOP has `BACKEND_URL` and `BACKEND_API_KEY` set (usually via `~/Top/.env`).
+- Ensure backend `.env` has `TOP_BACKEND_API_KEY` set and backend service was restarted after `.env` changes.
+- If you are debugging, temporarily set `TOP_REQUIRED=false` to allow the request to succeed while still returning `top.status`/`top.data`.
+
+### 14.5 Anonymization service tile redirects to Spider UI (SSO handoff)
+
+In `p3dx-auth-ui`, the Anonymization tile redirects the user to Spider and passes Keycloak tokens via URL hash:
+
+- Redirect target: `https://spider.p3dx.iudx.org.in/#access_token=...&refresh_token=...&expires_in=...`
+- Tokens are read from `localStorage` keys:
+  - `access_token`
+  - `refresh_token`
+  - `expires_in`
 
 ### 14.3 Keycloak admin UI not accessible
 
@@ -918,9 +1021,9 @@ Example alternate ports (avoids conflicts):
 ```bash
 autossh -M 0 -N \
   -o ClearAllForwardings=yes \
-  -L 8182:localhost:8080 \
-  -L 3002:localhost:3001 \
-  -L 3323:localhost:3322 \
+  -L 8181:localhost:8080 \
+  -L 3001:localhost:3001 \
+  -L 3322:localhost:3322 \
   p3dx-auth-vm
 ```
 
