@@ -1,0 +1,8 @@
+[Unit]
+Description=Anon auth full stack target
+After=network-online.target postgresql.service anon-immudb.service anon-keycloak.service
+Wants=postgresql.service anon-immudb.service anon-keycloak.service anon-backend.service
+Wants=network-online.target
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=Anon backend API service
+After=network-online.target anon-keycloak.service anon-immudb.service
+Wants=anon-keycloak.service anon-immudb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/p3dx-aaa
+Environment=NODE_ENV=production
+EnvironmentFile=/home/azureuser/p3dx-aaa/.env
+ExecStart=/usr/bin/node /home/azureuser/p3dx-aaa/src/server.js
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=anon-stack.target
