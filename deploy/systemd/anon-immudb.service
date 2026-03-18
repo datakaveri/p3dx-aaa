@@ -1,0 +1,16 @@
+[Unit]
+Description=Anon stack immuDB container
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+ExecStartPre=/usr/bin/bash -lc 'if ! /snap/bin/docker container inspect immudb >/dev/null 2>&1; then /snap/bin/docker volume create immudb-data >/dev/null; /snap/bin/docker create --name immudb -p 3322:3322 -v immudb-data:/var/lib/immudb codenotary/immudb:latest >/dev/null; fi'
+ExecStart=/snap/bin/docker start -a immudb
+ExecStop=/snap/bin/docker stop -t 20 immudb
+
+[Install]
+WantedBy=anon-stack.target

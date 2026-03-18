@@ -1,0 +1,24 @@
+[Unit]
+Description=Anon stack Keycloak
+After=network-online.target postgresql.service
+Requires=postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/keycloak-26.4.7
+EnvironmentFile=/etc/anon-stack/keycloak.env
+Environment=KC_HEALTH_ENABLED=true
+Environment=KC_METRICS_ENABLED=true
+Environment=KC_HTTP_ENABLED=true
+ExecStart=/home/azureuser/keycloak-26.4.7/bin/kc.sh start --db=postgres --db-url=jdbc:postgresql://localhost:5432/keycloak --db-username=${KC_DB_USERNAME} --db-password=${KC_DB_PASSWORD} --hostname-strict=false --proxy-headers=xforwarded --http-port=8080
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=anon-stack.target
