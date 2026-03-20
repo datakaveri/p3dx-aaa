@@ -1,5 +1,8 @@
 import { Router } from 'express';
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
 import { requireAnyRole, requireRole } from '../middlewares/role.middleware.js';
 import {
@@ -22,6 +25,16 @@ import { createWorkloadContract } from '../services/contractGen.service.js';
 import { sendContractToTop } from '../services/top.service.js';
 
 const router = Router();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+async function loadComposeUrlsConfig() {
+  const configPath = path.resolve(__dirname, '..', 'config', 'compose-urls.json');
+  const raw = await readFile(configPath, 'utf8');
+  const parsed = JSON.parse(raw);
+  return parsed && typeof parsed === 'object' ? parsed : null;
+}
 
 function requireTopApiKey(req, res, next) {
   const expectedRaw = process.env.TOP_BACKEND_API_KEY;
@@ -132,6 +145,66 @@ router.post('/register', async (req, res, next) => {
   }
 });
 
+router.get(
+  '/workloads/contracts/:contractId/result',
+  verifyJWT,
+  requireRole('user'),
+  async (req, res, next) => {
+    try {
+      const { contractId } = req.params;
+      const record = await getWorkloadContractById(contractId);
+
+      if (!record) {
+        return res.status(404).json({ status: 'FAILED', error: 'CONTRACT_NOT_FOUND' });
+      }
+
+      const contract = record?.contract || record?.stored?.contract || record?.stored?.value?.contract;
+      const contractObj = contract && typeof contract === 'object' ? contract : null;
+      const appId = contractObj?.application_provider_terms?.app_id;
+
+      const topBaseRaw = process.env.TOP_BASE_URL;
+      const topBase = typeof topBaseRaw === 'string' ? topBaseRaw.trim().replace(/\/+$/, '') : '';
+      if (!topBase) {
+        return res.status(503).json({ status: 'FAILED', error: 'TOP_NOT_CONFIGURED' });
+      }
+
+      const url = `${topBase}/contracts/${contractId}`;
+      const upstream = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const text = await upstream.text();
+      let data;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = null;
+      }
+
+      if (!upstream.ok || data?.status !== 'SUCCESS') {
+        return res.status(502).json({
+          status: 'FAILED',
+          error: 'TOP_SIGNED_CONTRACT_FETCH_FAILED',
+          ...(process.env.NODE_ENV === 'production' ? {} : { detail: data || text }),
+        });
+      }
+
+      return res.status(200).json({
+        status: 'SUCCESS',
+        tee_status: 'STARTED',
+        contract_id: contractId,
+        app_id: appId,
+        signed_contract: data.contract,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 router.post('/login', async (req, res, next) => {
   const { username, password } = req.body;
 
@@ -201,13 +274,24 @@ router.post('/workloads/run', verifyJWT, requireRole('user'), async (req, res, n
       return res.status(400).json({ status: 'FAILED', error: 'MISSING_WORKLOAD_INPUT' });
     }
 
+    console.log('[P3DX_STEP_OK] workload/run: request accepted', {
+      datasetId,
+      applicationId,
+      user: req.user?.preferred_username || req.user?.sub,
+    });
+
     const contract = await createWorkloadContract({
       jwt: keycloakToken,
       datasetId,
       applicationId,
     });
 
-    await storeWorkloadContract({
+    console.log('[P3DX_STEP_OK] workload/run: contract created', {
+      contractId: contract?.contract_id || contract?.contractId,
+      hasSignature: Boolean(contract?.signature || contract?.signatures?.consumer_signature || contract?.signatures?.consumerSignature),
+    });
+
+    const stored = await storeWorkloadContract({
       contract,
       datasetId,
       applicationId,
@@ -219,6 +303,12 @@ router.post('/workloads/run', verifyJWT, requireRole('user'), async (req, res, n
       },
     });
 
+    console.log('[P3DX_STEP_OK] workload/run: contract stored (immudb)', {
+      contractId: contract?.contract_id || contract?.contractId,
+      stored: Boolean(stored?.stored),
+      errorsCount: Array.isArray(stored?.errors) ? stored.errors.length : 0,
+    });
+
     let topResult = null;
     try {
       topResult = await sendContractToTop({
@@ -227,6 +317,13 @@ router.post('/workloads/run', verifyJWT, requireRole('user'), async (req, res, n
         datasetId,
         applicationId,
         user: req.user,
+      });
+
+      console.log('[P3DX_STEP_OK] workload/run: contract sent to TOP', {
+        contractId: contract?.contract_id || contract?.contractId,
+        sent: Boolean(topResult?.sent),
+        skipped: Boolean(topResult?.skipped),
+        status: topResult?.status,
       });
 
       const requiredRaw = process.env.TOP_REQUIRED;
@@ -295,12 +392,40 @@ router.post(
       }
 
       const match = provided === expected;
+
+      if (match) {
+        console.log('[P3DX_STEP_OK] token-verify: match', { contractId });
+      }
       return res.status(200).json({ status: 'SUCCESS', match });
     } catch (err) {
       next(err);
     }
   }
 );
+
+// TOP -> backend: return docker compose URL for a given appId.
+// This is used by TOP to trigger TEE deployment based on the contract app_id.
+router.get('/apps/:appId/compose-url', requireTopApiKey, async (req, res, next) => {
+  try {
+    const appId = String(req.params?.appId || '').trim();
+    if (!appId) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_APP_ID' });
+    }
+
+    const cfg = await loadComposeUrlsConfig();
+    const composeUrls = cfg?.compose_urls;
+    const url = composeUrls && typeof composeUrls === 'object' ? String(composeUrls[appId] || '').trim() : '';
+    if (!url) {
+      return res.status(404).json({ status: 'FAILED', error: 'COMPOSE_URL_NOT_FOUND' });
+    }
+
+    console.log('[P3DX_STEP_OK] compose-url: resolved', { appId });
+
+    return res.status(200).json({ status: 'SUCCESS', app_id: appId, compose_url: url });
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.get('/workloads/contracts/:contractId', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {
@@ -471,6 +596,11 @@ router.post('/policy', verifyJWT, requireRole('user'), async (req, res, next) =>
         ...(process.env.NODE_ENV === 'production' ? {} : { detail: data || text }),
       });
     }
+
+    console.log('[P3DX_STEP_OK] policy: submitted to APD', {
+      policyId: data?.policyId,
+      itemId: data?.itemId,
+    });
 
     return res.status(201).json({ status: 'SUCCESS', apd: data });
   } catch (err) {
