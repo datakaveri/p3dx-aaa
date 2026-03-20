@@ -356,7 +356,61 @@ router.post('/workloads/run', verifyJWT, requireRole('user'), async (req, res, n
       }
     }
 
-    return res.status(201).json({ status: 'SUCCESS', contract, top: topResult });
+    let signedContract = null;
+    if (topResult?.sent === true) {
+      const topBaseRaw = process.env.TOP_BASE_URL;
+      const topBase = typeof topBaseRaw === 'string' ? topBaseRaw.trim().replace(/\/+$/, '') : '';
+      if (!topBase) {
+        return res.status(503).json({ status: 'FAILED', error: 'TOP_NOT_CONFIGURED' });
+      }
+
+      const contractId = contract?.contract_id || contract?.contractId;
+      const url = `${topBase}/contracts/${contractId}`;
+      const upstream = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const text = await upstream.text();
+      let data;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = null;
+      }
+
+      if (!upstream.ok || data?.status !== 'SUCCESS') {
+        return res.status(502).json({
+          status: 'FAILED',
+          error: 'TOP_SIGNED_CONTRACT_FETCH_FAILED',
+          ...(process.env.NODE_ENV === 'production' ? {} : { detail: data || text }),
+        });
+      }
+
+      signedContract = data?.contract;
+
+      await storeWorkloadContract({
+        contract: signedContract,
+        datasetId,
+        applicationId,
+        user: req.user,
+        metadata: {
+          ip: req.ip,
+          userAgent: req.get('user-agent'),
+          token_fingerprint: tokenFingerprint,
+          top_signed: true,
+          top_status: topResult?.status,
+        },
+      });
+
+      console.log('[P3DX_STEP_OK] workload/run: signed contract fetched from TOP and stored (immudb)', {
+        contractId: contract?.contract_id || contract?.contractId,
+      });
+    }
+
+    return res.status(201).json({ status: 'SUCCESS', contract, signed_contract: signedContract, top: topResult });
   } catch (err) {
     next(err);
   }
