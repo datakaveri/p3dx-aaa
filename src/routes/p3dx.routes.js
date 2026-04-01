@@ -205,6 +205,10 @@ router.get(
   }
 );
 
+router.get('/login', (_req, res) => {
+  res.redirect('/login');
+});
+
 router.post('/login', async (req, res, next) => {
   const { username, password } = req.body;
 

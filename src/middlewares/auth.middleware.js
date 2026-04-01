@@ -54,7 +54,7 @@ export async function verifyJWT(req, res, next) {
     const token = authHeader.split(" ")[1];
 
     const { payload } = await jwtVerify(token, getJWKS(), {
-      // ⚠️ DO NOT hard-fail issuer in dev / SSH tunnel setups
+      // DO NOT hard-fail issuer in dev / SSH tunnel setups
       // issuer removed intentionally
     });
 
