@@ -9,7 +9,7 @@ async function start() {
     await initImmuDB();
 
     app.listen(PORT, () => {
-      console.log(`Anon backend running on port ${PORT}`);
+      console.log(`p3dx-aaa auth backend running on port ${PORT}`);
     });
   } catch (error) {
     console.error('Error starting server:', error);

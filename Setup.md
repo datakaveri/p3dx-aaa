@@ -15,12 +15,18 @@ It is written so a teammate can reproduce the full environment from scratch.
 
 ## 0) Architecture (high-level)
 
-Frontend (React/Vite, local dev)
-  -> HTTP JSON
-p3dx-aaa auth backend (Node.js/Express, VM, port `<PORT>`)
+```
+Browser / Spider UI
+  -> HTTPS (443)
+nginx (auth.p3dx.iudx.org.in)
+  -> GET /  and frontend routes  -> serves p3dx-auth-ui/dist/ (React SPA)
+  -> /anon/* and /p3dx/*         -> proxy to p3dx-aaa (port 3001)
+
+p3dx-aaa auth backend (Node.js/Express, VM, port 3001)
   -> Keycloak Admin API + OIDC token endpoint
 Keycloak (VM, port 8080)
   -> PostgreSQL (VM local service, port 5432)
+```
 
 Workload orchestration (POC):
 
@@ -40,9 +46,10 @@ p3dx-aaa auth backend -> immuDB (VM, port 3322)
 
 ### VM-side ports
 
+- HTTPS (nginx): `443` — public entry point; serves auth UI + proxies API
 - SSH: `22`
 - Keycloak: `8080` (dev mode typically binds to all interfaces)
-- p3dx-aaa auth backend: `3001`
+- p3dx-aaa auth backend: `3001` (managed by systemd; nginx proxies to this)
 - PostgreSQL (Keycloak DB): `5432` (local to VM)
 - immuDB: `3322`
 - APD (Go, local dev): `8082` (optional; used for policy submissions)
@@ -398,6 +405,105 @@ curl -s http://localhost:8082/health
 
 ---
 
+## 9.6) nginx setup (serves auth UI + proxies API)
+
+nginx is the public entry point for `https://auth.p3dx.iudx.org.in`. It serves two things:
+
+- **Auth UI** (`p3dx-auth-ui/dist/`) — the React SPA for all non-API paths
+- **API proxy** — forwards `/anon/*` and `/p3dx/*` to the backend on port 3001
+
+### 9.6.1 nginx config location
+
+```
+/etc/nginx/sites-available/auth.p3dx.iudx.org.in
+/etc/nginx/sites-enabled/auth.p3dx.iudx.org.in  (symlink)
+```
+
+### 9.6.2 Config structure
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name auth.p3dx.iudx.org.in;
+    # ... SSL certs ...
+
+    # Static assets (long cache — Vite adds content hash to filenames)
+    location /assets/ {
+        root /home/azureuser/p3dx-auth-ui/dist;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # API routes → backend (port 3001)
+    location /anon/ { proxy_pass http://127.0.0.1:3001; ... }
+    location /p3dx/ { proxy_pass http://127.0.0.1:3001; ... }
+
+    # SPA catch-all: serve index.html for all other GET paths
+    location / {
+        root /home/azureuser/p3dx-auth-ui/dist;
+        try_files $uri $uri/ /index.html;
+    }
+}
+```
+
+### 9.6.3 How GET /p3dx/login works
+
+When Spider logs the user out it redirects the browser to `https://auth.p3dx.iudx.org.in/p3dx/login`:
+
+1. nginx matches `/p3dx/` → proxies to backend
+2. Backend `GET /login` handler returns `302 → /login`
+3. Browser follows redirect to `https://auth.p3dx.iudx.org.in/login`
+4. nginx: `/login` does not match `/anon/` or `/p3dx/` → serves `dist/index.html`
+5. React Router sees `/login` → renders Login page ✓
+
+### 9.6.4 Reload nginx after config changes
+
+```bash
+sudo nginx -t          # test config first
+sudo systemctl reload nginx
+```
+
+---
+
+## 9.7) Auth UI deployment (p3dx-auth-ui)
+
+The React auth UI is built to `p3dx-auth-ui/dist/` and served by nginx as a static SPA.
+
+### 9.7.1 Production environment file
+
+`/home/azureuser/p3dx-auth-ui/.env.production`:
+
+```env
+VITE_BACKEND_URL=https://auth.p3dx.iudx.org.in
+VITE_APP_URL=https://auth.p3dx.iudx.org.in
+```
+
+This ensures the login form POSTs to `https://auth.p3dx.iudx.org.in/p3dx/login` (not localhost).
+
+### 9.7.2 Build and deploy
+
+```bash
+cd ~/p3dx-auth-ui
+npm install         # if node_modules is missing
+npm run build       # outputs to dist/
+```
+
+nginx serves the new `dist/` immediately — no nginx restart needed after a rebuild.
+
+### 9.7.3 Directory permissions
+
+nginx runs as `www-data`. The home directory and dist folder must be traversable:
+
+```bash
+chmod o+x /home/azureuser
+chmod o+x /home/azureuser/p3dx-auth-ui
+chmod o+x /home/azureuser/p3dx-auth-ui/dist
+```
+
+These only need to be set once.
+
+---
+
 ## 12.6) Policy submission verification (APD)
 
 After submitting a policy via the UI, use the `policyId` to confirm APD stored it:
@@ -431,9 +537,12 @@ Base URL: `http://<vm>:<PORT>` (or `http://localhost:<PORT>` if port-forwarded)
 
 ### 10.1 Auth endpoints
 
+- `GET  /p3dx/login` — browser redirect to `/login` (the React login page); used when Spider logs out
+- `POST /p3dx/login` — authenticate with username + password; returns `access_token`, `refresh_token`, `expires_in`
 - `POST /p3dx/register`
-- `POST /p3dx/login`
-- `GET /p3dx/me` (protected; requires Bearer token + role `user`)
+- `GET  /p3dx/me` (protected; requires Bearer token + role `user`)
+
+`/anon/*` is a full alias for `/p3dx/*` (both paths are mounted on the same route handlers). Spider uses `POST /anon/login` for its login API calls; both work identically.
 
 ### 10.2 P3DX endpoints (role requests + policies)
 
@@ -454,7 +563,7 @@ Base path: `/p3dx`
 ```json
 {
   "policyId": "policy-<uuid>",
-  "itemId": "ds-1",
+  "itemId": "ds-001",
   "issuedBy": "<username>",
   "rules": { "any": "json" },
   "expiresAt": "2026-03-14T00:00:00.000Z"
@@ -467,8 +576,6 @@ Notes:
 - `rules` is free-form JSON; APD stores it as-is.
 
 #### `POST /p3dx/maa-tokens`
-
-Note: `/anon/*` is currently kept as a backward-compatible alias for `/p3dx/*`, but new clients should use `/p3dx`.
 
 - **Purpose**
   - UI submits one or more MAA tokens; backend verifies the Keycloak JWT and stores mappings in immuDB.
@@ -520,7 +627,7 @@ Event types logged:
 
 ## 12) Verification / test commands
 
-From repo root:
+All commands run from the repo root (`~/p3dx-aaa`).
 
 ### 12.1 Diagnose immuDB connectivity
 
@@ -528,19 +635,51 @@ From repo root:
 npm run diagnose:immudb
 ```
 
-### 12.2 End-to-end API test
+### 12.2 End-to-end auth test (register → login → profile)
 
 ```bash
 npm run test:e2e
 ```
 
-### 12.3 Full immuDB audit test suite
+### 12.3 Workload contract test
+
+Requires a running backend (and optionally TOP + APD for full flow).
+
+```bash
+npm run test:workload
+```
+
+Env overrides: `DATASET_ID`, `APPLICATION_ID`, `TEST_USERNAME`, `TEST_PASSWORD`.
+
+### 12.4 Policy submission test
+
+Requires a user with the `data-provider` role and APD running.
+
+```bash
+TEST_DP_USERNAME=<user> TEST_DP_PASSWORD=<pass> npm run test:policy
+```
+
+### 12.5 Role request workflow test
+
+Requires an admin account.
+
+```bash
+TEST_ADMIN_USERNAME=<admin> TEST_ADMIN_PASSWORD=<pass> npm run test:role-requests
+```
+
+### 12.6 MAA token submission test
+
+```bash
+npm run test:maa
+```
+
+### 12.7 Full immuDB audit test suite
 
 ```bash
 npm run test:immudb
 ```
 
-### 12.4 Print audit events
+### 12.8 Print audit events
 
 ```bash
 npm run test:audit
@@ -636,13 +775,83 @@ cd ~/p3dx-aaa
 npm run test:audit
 ```
 
+> **Note:** `view-audit.js` is an older variant of the same audit viewer kept for reference; prefer `verify-audit.js` via `npm run test:audit`.
+
+### `test-workload.js` (workload contract E2E)
+
+- **Purpose**
+  - Registers a test user (or reuses `TEST_USERNAME`/`TEST_PASSWORD`), runs a workload via `POST /p3dx/workloads/run`, retrieves the stored contract from immuDB, and optionally fetches the TOP-signed result
+  - Proves the full contract pipeline — contract generation, immuDB persistence, TOP submission — works end-to-end
+- **When to use**
+  - After changing `contractGen.service.js` or the Go contract generator
+  - After changing TOP integration env vars (`TOP_BASE_URL`, `TOP_PAYLOAD_MODE`)
+  - After updating `catalogueData.js` dataset/application IDs
+- **How to run**
+
+```bash
+cd ~/p3dx-aaa
+# Minimal — auto-registers a fresh user
+npm run test:workload
+
+# Use existing credentials and override dataset/app
+BASE_URL=http://localhost:3001 \
+TEST_USERNAME=alice TEST_PASSWORD=secret \
+DATASET_ID=ds-001 APPLICATION_ID=app-1 \
+npm run test:workload
+```
+
+### `test-policy.js` (data-provider policy submission)
+
+- **Purpose**
+  - Logs in as a `data-provider` user, verifies the role via `/p3dx/me`, and submits a dataset access policy via `POST /p3dx/policy` (which the backend proxies to APD)
+  - Exits successfully (code 0) if APD is not running; only fails on auth or backend errors
+- **When to use**
+  - After changing the policy proxy route or APD config (`APD_BASE_URL`)
+  - To confirm a `data-provider` account is correctly set up in Keycloak
+- **How to run**
+
+```bash
+cd ~/p3dx-aaa
+TEST_DP_USERNAME=<data-provider-user> TEST_DP_PASSWORD=<pass> npm run test:policy
+```
+
+### `test-role-requests.js` (role request workflow)
+
+- **Purpose**
+  - Auto-registers a new user, requests the `data-provider` role, verifies it appears in "my requests", then logs in as admin and approves it, and re-logs in as the user to confirm the role was granted
+  - Exercises the full role request lifecycle: creation → admin list → approval → role reflected in token
+- **When to use**
+  - After changing role request routes or Keycloak role-assignment logic
+  - To verify an admin account has the `admin` realm role
+- **How to run**
+
+```bash
+cd ~/p3dx-aaa
+TEST_ADMIN_USERNAME=<admin-user> TEST_ADMIN_PASSWORD=<pass> npm run test:role-requests
+```
+
+### `test-maa-tokens.js` (MAA token storage)
+
+- **Purpose**
+  - Logs in as a `user` and POSTs a mock MAA attestation token payload to `POST /p3dx/maa-tokens`
+  - Verifies the endpoint accepts the token and logs the audit event
+- **When to use**
+  - After changing the MAA token route
+  - During TEE attestation integration testing
+- **How to run**
+
+```bash
+cd ~/p3dx-aaa
+npm run test:maa
+```
+
 ### `src/` (the backend)
 
 - **Purpose**
   - Implements the Express server + Keycloak integration + immuDB audit logging
 - **How to start**
 
-Run these commands from the backend repo root (commonly `~/p3dx-aaa`). If you checked out a working copy named `p3dx-aaa-local` on this branch, use that directory instead.
+Run these commands from the backend repo root (`~/p3dx-aaa`).
 
 ```bash
 cd ~/p3dx-aaa
@@ -665,6 +874,14 @@ npm start
   - Runs `node test-immudb-audit.js`
 - **`npm run test:audit`**
   - Runs `node verify-audit.js`
+- **`npm run test:workload`**
+  - Runs `node test-workload.js` — workload contract E2E (register → run → retrieve → optional result)
+- **`npm run test:policy`**
+  - Runs `node test-policy.js` — data-provider policy submission (requires `TEST_DP_USERNAME`/`TEST_DP_PASSWORD`)
+- **`npm run test:role-requests`**
+  - Runs `node test-role-requests.js` — full role request lifecycle (requires `TEST_ADMIN_USERNAME`/`TEST_ADMIN_PASSWORD`)
+- **`npm run test:maa`**
+  - Runs `node test-maa-tokens.js` — MAA attestation token submission
 
 ---
 
@@ -833,7 +1050,7 @@ TOP contract retrieval endpoint (POC):
 
 Required env vars for result flow (POC):
 
-- Backend (`p3dx-aaa-local`)
+- Backend (`p3dx-aaa`)
   - `TOP_BASE_URL` must point to TOP, e.g. `http://localhost:8085`.
   - Used by `GET /p3dx/workloads/contracts/:contractId/result` to fetch `GET ${TOP_BASE_URL}/contracts/:contractId`.
 - TOP
@@ -871,7 +1088,7 @@ This proof-of-concept has four main runtime components:
 
 The **Auth UI** (`p3dx-auth-ui`) is the user-facing dashboard where a consumer triggers “Run Workload” and later views the workload result (TEE started + final signed contract).
 
-The **Auth Backend** (`p3dx-aaa-local`) is the central API gateway for the UI. It handles user authentication (Keycloak JWT), generates the workload contract, writes an immutable audit record to immuDB, and orchestrates a submission to TOP.
+The **Auth Backend** (`p3dx-aaa`) is the central API gateway for the UI. It handles user authentication (Keycloak JWT), generates the workload contract, writes an immutable audit record to immuDB, and orchestrates a submission to TOP.
 
 The **Trusted Orchestrator Platform (TOP)** (`~/Top`) is the contract-ingestion component. It verifies that the user token TOP received matches what the backend used to generate the contract (token fingerprint verification), fetches the dataset policy from APD, embeds the orchestrator signature in the contract, persists the signed contract to disk, resolves a docker-compose reference by `app_id` via the backend, and triggers the “TEE deploy” step (dry-run by default).
 
@@ -990,6 +1207,10 @@ In `p3dx-auth-ui`, the Anonymization tile redirects the user to Spider and passe
   - `refresh_token`
   - `expires_in`
 
+**Spider logout redirect (important):**
+
+When Spider logs out, it must redirect the user to `https://auth.p3dx.iudx.org.in/p3dx/login` so they land on our custom login page (not Keycloak's built-in login page). This URL must be configured in the Spider UI's settings or in Keycloak admin under the `anon-backend` client's **Valid post logout redirect URIs**. If this is not set, Spider will redirect to the Keycloak login page at `https://login.p3dx.iudx.org.in/` instead.
+
 ### 14.3 Keycloak admin UI not accessible
 
 - Ensure Keycloak is running on VM: check its logs
@@ -1022,11 +1243,24 @@ bin/kc.sh start-dev \
 /snap/bin/docker start immudb
 ```
 
-### Start backend
+### Start nginx
 
 ```bash
-cd ~/p3dx-aaa
-npm start
+sudo systemctl start nginx
+```
+
+### Start backend (p3dx-aaa, port 3001)
+
+The backend is managed by systemd. nginx proxies `/anon/*` and `/p3dx/*` to this service.
+
+```bash
+sudo systemctl start p3dx-aaa-auth-backend.service
+```
+
+Check status:
+
+```bash
+sudo systemctl status p3dx-aaa-auth-backend.service
 ```
 
 ---
@@ -1057,6 +1291,8 @@ Notes:
 - `immudb-container.service` intentionally wraps Docker commands using `/bin/bash -lc` (systemd does not interpret pipes like `|` unless run through a shell).
 
 ### 17.1 Install unit files
+
+> **After merging to main:** The unit file `systemd/p3dx-aaa-auth-backend.service` references `WorkingDirectory`, `EnvironmentFile`, and `ExecStart` paths. Ensure these point to `~/p3dx-aaa` (not a working-copy directory) before installing.
 
 Copy the unit files into systemd:
 
@@ -1242,7 +1478,7 @@ The immuDB integration lives in `src/services/immudb.service.js` and is used for
 
 This is a consolidated list of the HTTP endpoints used across components in this proof-of-concept.
 
-### Auth Backend (p3dx-aaa-local) — Express API
+### Auth Backend (p3dx-aaa) — Express API
 
 Note: the same router is mounted under both `/p3dx/*` and `/anon/*`.
 
