@@ -31,7 +31,7 @@ Keycloak (VM, port 8080)
 Workload orchestration (POC):
 
 p3dx-aaa auth backend -> TOP (Go) (VM local, port 8085)
-  -> TOP verifies user token fingerprint with backend and stores contract
+  -> TOP creates contract, consumer-signs + orchestrator-signs it, triggers TEE deploy
 
 Policy storage (optional local dev):
 
@@ -361,30 +361,38 @@ Example paths:
 
 ### 9.5.4 Run APD
 
-Example (as used during verification):
+All environment variables are stored in `/home/azureuser/p3dx-apd/.env` (already configured — do not commit this file):
+
+```
+PORT=8082
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=apd
+DB_PASSWORD=apdpass
+DB_NAME=apd
+DB_SSLMODE=disable
+JWT_PRIVATE_KEY_PATH=/home/azureuser/p3dx-apd/keys/jwt_private.pem
+JWT_PUBLIC_KEY_PATH=/home/azureuser/p3dx-apd/keys/jwt_public.pem
+JWT_ISSUER=http://localhost:8082
+TEE_ORCHESTRATOR_URL=http://localhost:9999
+APD_BASE_URL=http://localhost:8082
+APD_SIGNING_KEY_PATH=/home/azureuser/p3dx-apd/keys/jwt_private.pem
+APD_POLICY_DUMP_DIR=/home/azureuser/p3dx-apd/policies
+```
+
+Build and run manually:
 
 ```bash
-export PORT=8082
+cd ~/p3dx-apd
+go build -o /tmp/p3dx-apd ./cmd/server/main.go
+set -a && source .env && set +a
+/tmp/p3dx-apd
+```
 
-export DB_HOST=localhost
-export DB_PORT=5432
-export DB_USER=apd
-export DB_PASSWORD=apdpass
-export DB_NAME=apd
-export DB_SSLMODE=disable
+Or use the platform startup script (recommended — starts all services at once):
 
-export JWT_PRIVATE_KEY_PATH=/home/azureuser/p3dx-apd/keys/jwt_private.pem
-export JWT_PUBLIC_KEY_PATH=/home/azureuser/p3dx-apd/keys/jwt_public.pem
-export JWT_ISSUER=http://localhost:8082
-
-export TEE_ORCHESTRATOR_URL=http://localhost:9999
-export APD_BASE_URL=http://localhost:8082
-export APD_SIGNING_KEY_PATH=/home/azureuser/p3dx-apd/keys/jwt_private.pem
-
-# Optional (POC): dump every received policy payload into a new JSON file
-export APD_POLICY_DUMP_DIR=/home/azureuser/p3dx-apd/policies
-
-go run ./cmd/server/main.go
+```bash
+~/start-p3dx.sh
 ```
 
 Expected:
@@ -780,11 +788,11 @@ npm run test:audit
 ### `test-workload.js` (workload contract E2E)
 
 - **Purpose**
-  - Registers a test user (or reuses `TEST_USERNAME`/`TEST_PASSWORD`), runs a workload via `POST /p3dx/workloads/run`, retrieves the stored contract from immuDB, and optionally fetches the TOP-signed result
-  - Proves the full contract pipeline — contract generation, immuDB persistence, TOP submission — works end-to-end
+  - Registers a test user (or reuses `TEST_USERNAME`/`TEST_PASSWORD`), runs a workload via `POST /p3dx/workloads/run`, verifies the returned signed contract has both consumer and orchestrator signatures, confirms the immuDB audit record is stored, and optionally verifies the `/result` endpoint
+  - Proves the full contract pipeline — TOP contract creation, consumer + orchestrator signing, immuDB persistence — works end-to-end
 - **When to use**
-  - After changing `contractGen.service.js` or the Go contract generator
-  - After changing TOP integration env vars (`TOP_BASE_URL`, `TOP_PAYLOAD_MODE`)
+  - After changing the TOP `/workload` handler or contract creation logic
+  - After changing TOP integration env vars (`TOP_BASE_URL`, `CONTRACT_SERVER_SECRET`)
   - After updating `catalogueData.js` dataset/application IDs
 - **How to run**
 
@@ -887,81 +895,64 @@ npm start
 
 ## 12.5 Workload contract (Run Workload)
 
-When a user clicks "Run Workload" in the UI, the backend creates a workload contract using the vendored Go generator, generates a user-side consent proof/signature, and persists the signed contract + consent metadata to immuDB.
+When a user clicks “Run Workload” in the UI, p3dx-aaa forwards the raw workload parameters to TOP. TOP owns the full contract lifecycle: it creates the contract, produces the consumer HMAC signature, validates the dataset policy with APD, signs with the orchestrator key, stores the signed contract to disk, and triggers TEE deployment. p3dx-aaa receives the fully signed contract back in TOP's response, stores it in immuDB, and returns it to the UI.
 
 ### API endpoints
 
 - `POST /p3dx/workloads/run`
   - **Auth**: requires Keycloak JWT (`Authorization: Bearer ...`) and `user` role
-  - **Body**: `{ "datasetId": "...", "applicationId": "..." }`
-  - **Response**: `{ status: "SUCCESS", contract: { ... }, top: { ... } }`
+  - **Body**: `{ “datasetId”: “...”, “applicationId”: “...” }`
+  - **Response**: `{ status: “SUCCESS”, contract_id: “...”, contract: { ... }, top: { ... } }`
+    - `contract` is the fully signed contract (consumer + orchestrator signatures present) returned by TOP.
+    - `contract` is `null` if TOP is disabled or unreachable.
   - **Behavior**
-    - Generates a signed workload contract via the Go contract generator.
-    - Stores the contract + consent metadata in immuDB.
-    - Optionally submits the generated contract to TOP (TEE Orchestration component) if enabled via env.
-      - **TOP endpoint**: `POST ${TOP_BASE_URL}${TOP_CONTRACT_ENDPOINT}` (default `/contract`)
-      - **Auth**: passes the same user JWT as `Authorization: Bearer ...`
-      - **Payload**
-        - If `TOP_PAYLOAD_MODE=raw`: sends the generated contract JSON as-is.
-        - If `TOP_PAYLOAD_MODE=wrapper` (default): sends `{ "access_token": "...", "signature": "...", "contract": { ... } }`.
+    - Forwards `{ access_token, dataset_id, application_id }` to TOP (`POST ${TOP_BASE_URL}/workload`).
+    - TOP creates and signs the contract (see TOP pipeline below).
+    - Stores the returned signed contract once in immuDB.
 - `GET /p3dx/workloads/contracts/:contractId/result`
   - **Auth**: Bearer JWT (user)
-  - **Response**: `{ status: "SUCCESS", tee_status: "STARTED", contract_id: "...", app_id: "...", signed_contract: { ... } }`
-  - **Behavior**
-    - Fetches the fully-signed contract (including orchestrator signature) from TOP.
-    - Returns a lightweight workload “result” payload used by the UI.
+  - **Response**: `{ status: “SUCCESS”, tee_status: “STARTED”, contract_id: “...”, app_id: “...”, signed_contract: { ... } }`
+  - **Behavior**: Fetches the stored signed contract from TOP (`GET ${TOP_BASE_URL}/contracts/:contractId`) and returns it to the UI.
 - `GET /p3dx/workloads/contracts/:contractId`
   - **Auth**: requires Keycloak JWT and `user` role
-  - **Response**: `{ status: "SUCCESS", record: { ... } }`
+  - **Response**: `{ status: “SUCCESS”, record: { ... } }` — retrieves the contract audit record from immuDB.
 
-### Required backend env vars
+### TOP pipeline (POST /workload)
 
-Add these to your backend `.env` (do not commit secrets):
+When TOP receives `{ access_token, dataset_id, application_id }` it runs these steps:
 
-- `CONTRACT_SERVER_SECRET`
-  - Strong random secret used by the contract generator to produce the user-side consent proof/signature.
+1. Decode JWT claims from `access_token` (`sub`, `sid`, `iat`, `exp`)
+2. Build contract struct — UUID `contract_id`, 90-day lifecycle, parties, dataset/app terms
+3. Compute consumer HMAC-SHA256 signature using `CONTRACT_SERVER_SECRET`
+4. Fetch dataset policy from APD — `GET ${APD_BASE_URL}/api/v1/policy/by-item/:datasetId` — reject if missing
+5. Store unsigned contract (AES-256-GCM encrypted `.bin` + plain `.json`)
+6. Sign with orchestrator RSA private key (PKCS1v15-SHA256); embed in `contract.signatures.orchestrator_signature`
+7. Overwrite stored contract with signed version
+8. Fetch docker-compose URL from backend — `GET ${BACKEND_URL}/p3dx/apps/:appId/compose-url` (X-API-Key)
+9. Call DeployEnclave (dry-run by default)
+10. Return `{ status: “success”, contract_id: “...”, contract: { ... } }`
 
-Optional contract generation env vars:
+### Required env vars
 
-- `CONTRACT_GEN_BIN`
-  - Path to the built Go binary (recommended under systemd).
-  - If empty, the backend falls back to `go run .` in `./contract-gen` (dev mode).
-- `CONTRACT_OVERRIDES_JSON`
-  - JSON string that is passed to the generator as `overrides` and merged over the generator defaults.
-  - Use this to inject real dataset/app/provider metadata (names, ids, urls, hashes, etc.) without changing Go code.
-
-Optional TOP integration env vars (see `.env.example`):
+**p3dx-aaa `.env`:**
 
 - `TOP_ENABLED=true`
 - `TOP_BASE_URL` (example: `http://localhost:8085`)
-- `TOP_CONTRACT_ENDPOINT` (default: `/contract`)
-- `TOP_PAYLOAD_MODE` (default: `wrapper`)
 - `TOP_AUTH_MODE=bearer`
-- `TOP_REQUIRED=true` to fail `POST /p3dx/workloads/run` if TOP submission fails
+- `TOP_REQUIRED=true` — fail `POST /p3dx/workloads/run` if TOP submission fails
 
-Console logging (POC):
+**TOP `.env`:**
 
-- Backend emits success-step logs prefixed with:
-  - `[P3DX_STEP_OK]`
-- TOP emits success-step logs prefixed with:
-  - `[TOP_STEP_OK]`
-
-TOP token consistency verification (TOP -> backend):
-
-- Backend stores a `sha256` fingerprint of the user access token used to create the contract.
-- TOP computes the same fingerprint for the token it received and verifies it with:
-  - `POST /p3dx/workloads/contracts/:contractId/token-verify`
-  - Header: `X-API-Key: <TOP_BACKEND_API_KEY>`
-  - Body: `{ "token_fingerprint": "<sha256 hex>" }`
-- Backend replies `{ status: "SUCCESS", match: true|false }`.
-
-Env:
-
-- `TOP_BACKEND_API_KEY` (required to enable the verification endpoint)
+- `CONTRACT_SERVER_SECRET` — HMAC secret for consumer signing (must be set in TOP, not p3dx-aaa)
+- `BACKEND_URL` — p3dx-aaa base URL (for compose-url callback)
+- `BACKEND_API_KEY` — shared key for TOP→backend callbacks
+- `APD_BASE_URL` — APD base URL (for policy fetch)
+- `ORCH_PRIVATE_KEY_PATH` — path to orchestrator RSA private key (falls back to mock if absent)
 
 TOP runtime configuration (POC):
 
 - TOP is a separate Go project (in this workspace under `~/Top`).
+- `TEE_DEPLOY_DRY_RUN=true` (default) — skips the actual enclave deploy HTTP call.
 - TOP loads environment from a local `.env` file via `godotenv.Load()` in `Top/main.go`.
 
 Create `~/Top/.env` (do not commit secrets):
@@ -986,7 +977,14 @@ Run TOP:
 
 ```bash
 cd ~/Top
-go run .
+go build -o /tmp/top-server .
+/tmp/top-server
+```
+
+TOP loads its `.env` automatically on startup (via `godotenv.Load()`). Or use the platform startup script (recommended):
+
+```bash
+~/start-p3dx.sh
 ```
 
 Strict behavior:
@@ -1088,9 +1086,9 @@ This proof-of-concept has four main runtime components:
 
 The **Auth UI** (`p3dx-auth-ui`) is the user-facing dashboard where a consumer triggers “Run Workload” and later views the workload result (TEE started + final signed contract).
 
-The **Auth Backend** (`p3dx-aaa`) is the central API gateway for the UI. It handles user authentication (Keycloak JWT), generates the workload contract, writes an immutable audit record to immuDB, and orchestrates a submission to TOP.
+The **Auth Backend** (`p3dx-aaa`) is the central API gateway for the UI. It handles user authentication (Keycloak JWT), forwards workload requests to TOP, writes the returned signed contract to immuDB as an immutable audit record, and serves the result to the UI.
 
-The **Trusted Orchestrator Platform (TOP)** (`~/Top`) is the contract-ingestion component. It verifies that the user token TOP received matches what the backend used to generate the contract (token fingerprint verification), fetches the dataset policy from APD, embeds the orchestrator signature in the contract, persists the signed contract to disk, resolves a docker-compose reference by `app_id` via the backend, and triggers the “TEE deploy” step (dry-run by default).
+The **Trusted Orchestrator Platform (TOP)** (`~/Top`) now owns the full contract lifecycle. It receives the raw workload parameters from p3dx-aaa, creates the contract struct, produces the consumer HMAC signature, fetches the dataset policy from APD, signs the contract with the orchestrator RSA key, persists the signed contract to disk, resolves the docker-compose reference for the application via the backend, and triggers TEE deployment (dry-run by default).
 
 The **APD** (`p3dx-apd`) is the policy service. A data-provider submits a policy into APD, and TOP fetches that policy by dataset id (`itemId`) before it accepts a contract. For POC resiliency, APD dumps received policies to disk and will reload policies from the dump directory on-demand when `/by-item/{itemId}` is called.
 
@@ -1098,29 +1096,31 @@ The **APD** (`p3dx-apd`) is the policy service. A data-provider submits a policy
 
 1) The consumer signs in to Keycloak via the UI. The UI stores the access token in `localStorage`.
 
-2) The consumer opens **Services → Run Workload** and clicks **Run Workload**.
+2) The consumer opens **Services → Run Workload**, selects a dataset and application, and clicks **Run Workload**.
 
 3) The UI calls the backend `POST /p3dx/workloads/run` with the user JWT (Bearer token) and the selected `{ datasetId, applicationId }`.
 
-4) The backend generates a workload contract using the Go generator (vendored under `contract-gen`). The contract includes a stable `contract_id` and a user-side signature/consent proof produced during generation.
+4) p3dx-aaa verifies the JWT and role, then forwards `{ access_token, dataset_id, application_id }` to TOP (`POST ${TOP_BASE_URL}/workload`).
 
-5) The backend writes an immutable record to immuDB keyed by `workload-contract:<contractId>` and also stores a `sha256` fingerprint of the user access token that was used to create the contract. This fingerprint is later used by TOP to validate token consistency.
+5) TOP decodes the JWT claims (`sub`, `sid`, `iat`, `exp`) from `access_token` and builds the contract struct — generating a UUID `contract_id`, 90-day lifecycle, all party and terms fields.
 
-6) If TOP integration is enabled, the backend submits the contract to TOP (`POST ${TOP_BASE_URL}${TOP_CONTRACT_ENDPOINT}`) and passes the same user JWT along.
+6) TOP computes the consumer HMAC-SHA256 signature using `CONTRACT_SERVER_SECRET` and embeds it in `contract.signatures.consumer_signature`.
 
-7) TOP receives the contract and computes its own `sha256` fingerprint of the user JWT it received. TOP calls back to the backend (`POST /p3dx/workloads/contracts/:contractId/token-verify`, protected by `TOP_BACKEND_API_KEY`) to confirm that TOP’s token fingerprint matches the one stored by the backend. If the token does not match, TOP rejects the contract.
+7) TOP fetches the dataset access policy from APD (`GET ${APD_BASE_URL}/api/v1/policy/by-item/{datasetId}`). If the policy is missing or APD fails, TOP rejects the contract.
 
-8) TOP extracts `datasetId` from the contract (`contract.data_provider_terms.data_resource_id`) and fetches the access policy from APD (`GET ${APD_BASE_URL}/api/v1/policy/by-item/{itemId}`). If the policy is missing (404) or APD fails, TOP rejects the contract (current POC behavior).
+8) TOP stores the unsigned contract to disk (AES-256-GCM encrypted `.bin` and plain `.json`).
 
-9) TOP signs the contract (or uses a mock signature if no key is configured) and embeds the orchestrator signature fields into `contract.signatures.*`. TOP then overwrites the stored contract artifacts on disk (`{contractId}.bin` and `{contractId}.json`).
+9) TOP signs the contract with the orchestrator RSA private key (PKCS1v15-SHA256) and embeds the signature in `contract.signatures.orchestrator_signature`. The signed contract overwrites the disk files.
 
-10) TOP extracts `app_id` from `contract.application_provider_terms.app_id` and calls back to the backend (`GET /p3dx/apps/{appId}/compose-url`, protected by `TOP_BACKEND_API_KEY`) to resolve the docker-compose reference for that `app_id`.
+10) TOP fetches the docker-compose URL from the backend (`GET ${BACKEND_URL}/p3dx/apps/{appId}/compose-url`, `X-API-Key` protected) to resolve the application’s enclave descriptor.
 
-11) TOP calls `DeployEnclave()` with the resolved `compose_url`. Since the deploy API is not hosted yet, TOP runs in `TEE_DEPLOY_DRY_RUN=true` by default, so the deploy call is skipped while TOP still logs `TEE started`.
+11) TOP calls `DeployEnclave()` with the signed contract and compose URL. `TEE_DEPLOY_DRY_RUN=true` (default) skips the actual HTTP call while still logging `TEE started`.
 
-12) The UI receives the successful response from `POST /p3dx/workloads/run`, extracts `contract_id`, and navigates to `/app/services/run/:contractId`.
+12) TOP returns `{ status: “success”, contract_id: “...”, contract: { ... } }` — the fully signed contract is in the response body.
 
-13) The Workload Result page calls `GET /p3dx/workloads/contracts/:contractId/result`. The backend fetches the final signed contract from TOP (`GET ${TOP_BASE_URL}/contracts/:contractId`) and returns it to the UI. The UI displays `TEE started` and renders the signed contract JSON.
+13) p3dx-aaa receives the signed contract, writes it to immuDB (`workload-contract:<contractId>`), and returns `{ status: “SUCCESS”, contract_id, contract, top }` to the UI.
+
+14) The UI navigates to `/app/services/run/:contractId`. The Workload Result page calls `GET /p3dx/workloads/contracts/:contractId/result`, which fetches the stored contract from TOP and returns it for display.
 
 ---
 
@@ -1321,6 +1321,24 @@ KC_DB_PASSWORD=<KEYCLOAK_DB_PASSWORD>
 
 ### 17.3 Enable and start
 
+#### Single-command startup (recommended)
+
+The `start-p3dx.sh` script in the home directory starts the entire platform — systemd services, p3dx-apd, TOP, and auth-ui — in one command:
+
+```bash
+~/start-p3dx.sh   # start everything
+~/stop-p3dx.sh    # stop everything
+```
+
+It builds the Go binaries fresh each run, sources `.env` files, starts background processes, and saves PIDs to `/tmp/p3dx-pids`. Logs go to `/tmp/p3dx-apd.log`, `/tmp/p3dx-top.log`, `/tmp/p3dx-ui.log`.
+
+#### Watch logs
+tail -f /tmp/p3dx-apd.log /tmp/p3dx-top.log /tmp/p3dx-ui.log   # watch all logs
+
+#### Manual systemd commands
+
+Enable and start on boot:
+
 ```bash
 sudo systemctl enable --now immudb-container.service
 sudo systemctl enable --now keycloak-dev.service
@@ -1489,13 +1507,13 @@ Note: the same router is mounted under both `/p3dx/*` and `/anon/*`.
 - `GET /p3dx/me`
   - Return the current authenticated user profile and roles.
 - `POST /p3dx/workloads/run`
-  - Generate a signed workload contract, store it in immuDB, and optionally submit it to TOP.
+  - Forward raw workload parameters (`access_token`, `dataset_id`, `application_id`) to TOP (`POST /workload`), which owns the full contract lifecycle. Store the returned signed contract in immuDB.
 - `GET /p3dx/workloads/contracts/:contractId`
   - Fetch the stored workload contract record from immuDB (backend view of the contract).
 - `GET /p3dx/workloads/contracts/:contractId/result`
   - Fetch the final signed contract from TOP and return a workload “result” payload for the UI.
 - `POST /p3dx/workloads/contracts/:contractId/token-verify`
-  - TOP→Backend: verify TOP’s user token fingerprint matches the backend’s stored fingerprint (requires `X-API-Key`).
+  - TOP→Backend: verify TOP’s user token fingerprint (requires `X-API-Key`). Legacy — not called in the current `POST /workload` flow.
 - `GET /p3dx/apps/:appId/compose-url`
   - TOP→Backend: resolve `app_id` to a docker-compose URL (requires `X-API-Key`).
 - `POST /p3dx/policy`
@@ -1511,10 +1529,12 @@ Note: the same router is mounted under both `/p3dx/*` and `/anon/*`.
 - `POST /p3dx/admin/role-requests/:id/decision`
   - Admin: approve/deny a role request.
 
-### TOP (~/Top) — contract ingestion + retrieval
+### TOP (~/Top) — contract lifecycle + retrieval
 
+- `POST /workload`
+  - **Primary.** Backend→TOP: accepts `{ access_token, dataset_id, application_id }` and runs the full contract lifecycle — JWT claim extraction, contract creation, consumer HMAC signing, APD policy fetch, orchestrator RSA signing, artifact storage, and `DeployEnclave()`. Returns `{ status, contract_id, contract }`.
 - `POST /contract`
-  - Backend→TOP: ingest a workload contract, verify token fingerprint with backend, fetch policy from APD, embed orchestrator signature, resolve compose URL, and trigger `DeployEnclave()`.
+  - **Legacy.** Accepts a pre-built contract from the caller and runs only the orchestrator signing + deploy pipeline (APD fetch → store → sign → compose-URL resolution → TEE deploy). Kept for backward compatibility; not called by p3dx-aaa in the current flow.
 - `GET /contracts/:contractId`
   - Backend→TOP: return the stored final signed contract JSON (`{contractId}.json`) for UI result rendering.
 

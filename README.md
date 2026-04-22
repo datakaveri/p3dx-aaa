@@ -2,7 +2,7 @@
 
 Authentication and audit backend for the P3DX platform, built with Node.js and Express.
 
-Integrates with **Keycloak** for identity management and **immuDB** for tamper-evident audit logging. Also handles workload contract generation (via a vendored Go module), policy submission proxying to APD, and role request workflows.
+Integrates with **Keycloak** for identity management and **immuDB** for tamper-evident audit logging. Also handles workload orchestration via TOP, policy submission proxying to APD, and role request workflows.
 
 ---
 
@@ -11,8 +11,8 @@ Integrates with **Keycloak** for identity management and **immuDB** for tamper-e
 - User registration and login via Keycloak (OIDC / ROPC flow)
 - JWT verification and role-based access control on all protected endpoints
 - Tamper-evident audit logging to immuDB for every login, registration, and workload event
-- Signed workload contract generation — encodes the dataset, application, and user consent into a cryptographically signed artifact
-- Contract submission to TOP (Trusted Orchestrator Protocol) for policy validation and TEE provisioning
+- Workload execution — forwards raw workload parameters (`access_token`, `dataset_id`, `application_id`) to TOP, which owns the full contract lifecycle (creation → consumer signing → policy check → orchestrator signing → TEE deployment)
+- Signed contract storage — stores the fully signed contract returned by TOP in immuDB
 - Policy submission proxying to APD (Access Policy Database)
 - Admin role request approval workflow
 
@@ -27,7 +27,7 @@ Both `/p3dx/*` and `/anon/*` path prefixes are supported and route to the same h
 - Node.js v18+
 - Keycloak running and configured (see Setup.md §5–7)
 - immuDB running (see Setup.md §8)
-- Go 1.22+ for the contract generator
+- TOP running and reachable (see Setup.md for TOP configuration)
 
 ### Install
 
@@ -81,10 +81,10 @@ Use `npm run dev` for auto-reload during development.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `POST` | `/p3dx/workloads/run` | Bearer + `user` | Generate signed contract, store in immuDB, submit to TOP |
+| `POST` | `/p3dx/workloads/run` | Bearer + `user` | Forward raw workload params to TOP; store returned signed contract in immuDB |
 | `GET` | `/p3dx/workloads/contracts/:contractId` | Bearer + `user` | Retrieve contract record from immuDB |
 | `GET` | `/p3dx/workloads/contracts/:contractId/result` | Bearer + `user` | Fetch final signed contract from TOP |
-| `POST` | `/p3dx/workloads/contracts/:contractId/token-verify` | `X-API-Key` | TOP→Backend: verify user token fingerprint |
+| `POST` | `/p3dx/workloads/contracts/:contractId/token-verify` | `X-API-Key` | TOP→Backend: verify user token fingerprint (legacy — not called in current flow) |
 | `GET` | `/p3dx/apps/:appId/compose-url` | `X-API-Key` | TOP→Backend: resolve app to docker-compose URL |
 
 ### Policies & Roles

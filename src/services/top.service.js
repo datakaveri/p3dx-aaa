@@ -44,7 +44,46 @@ function buildTopHeaders({ jwt }) {
   return headers;
 }
 
-export async function sendContractToTop({ contract, jwt, datasetId, applicationId, user }) {
+/**
+ * New endpoint — sends a raw workload request to TOP /workload.
+ * TOP creates the contract, consumer-signs it, runs the full pipeline,
+ * and returns { status, contract_id, contract } (the fully signed contract).
+ */
+export async function sendWorkloadToTop({ token, datasetId, applicationId }) {
+  const enabledRaw = process.env.TOP_ENABLED;
+  const enabled = typeof enabledRaw === 'string' ? enabledRaw.trim().toLowerCase() : 'false';
+  if (enabled !== 'true' && enabled !== '1' && enabled !== 'yes') {
+    return { sent: false, skipped: true };
+  }
+
+  const timeoutMsRaw = process.env.TOP_TIMEOUT_MS;
+  const timeout = Number(timeoutMsRaw);
+
+  const url = buildTopUrl('/workload');
+  const headers = buildTopHeaders({ jwt: token });
+
+  const payload = {
+    access_token: token,
+    dataset_id: datasetId,
+    application_id: applicationId,
+  };
+
+  const resp = await axios.post(url, payload, {
+    headers,
+    timeout: Number.isFinite(timeout) && timeout > 0 ? timeout : 30000,
+    validateStatus: () => true,
+  });
+
+  const ok = resp.status >= 200 && resp.status < 300;
+  return {
+    sent: ok,
+    skipped: false,
+    status: resp.status,
+    data: resp.data,
+  };
+}
+
+export async function sendContractToTop({ contract, jwt }) {
   const enabledRaw = process.env.TOP_ENABLED;
   const enabled = typeof enabledRaw === 'string' ? enabledRaw.trim().toLowerCase() : 'false';
   if (enabled !== 'true' && enabled !== '1' && enabled !== 'yes') {

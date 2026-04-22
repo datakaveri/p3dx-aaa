@@ -1,8 +1,13 @@
 /**
  * Workload Contract Test
  *
- * Flow: Register → Login → Run Workload → Verify Contract in immuDB
- *       → (if TOP is live) Fetch signed result
+ * Flow: Register/Login → Run Workload → Verify signed contract in response
+ *       → Retrieve contract from immuDB → (if TOP live) Verify orchestrator signature
+ *
+ * In the new architecture, contract creation, consumer signing, orchestrator
+ * signing, and TEE deployment all happen inside TOP (POST /workload).
+ * p3dx-aaa forwards the raw workload params and receives the fully signed
+ * contract back in the POST /workloads/run response — no separate GET needed.
  *
  * Env overrides (all optional):
  *   BASE_URL          default: http://localhost:3001
@@ -73,6 +78,9 @@ async function main() {
   console.log();
 
   // ── 2. Run workload ────────────────────────────────────────────────────────
+  // p3dx-aaa forwards { access_token, dataset_id, application_id } to TOP.
+  // TOP creates the contract, consumer-signs it, runs the pipeline, and returns
+  // the fully signed contract. p3dx-aaa stores it in immuDB and returns it here.
   log('STEP-2', 'Submitting workload (POST /p3dx/workloads/run)...', colors.blue);
 
   const runRes = await axios.post(
@@ -87,36 +95,58 @@ async function main() {
   }
 
   const contract = runRes.data.contract;
-  const contractId = contract?.contract_id || contract?.contractId;
+  const contractId = runRes.data.contract_id || contract?.contract_id;
   const topResult = runRes.data.top;
 
-  log('✓ PASS', `Workload submitted — contract_id: ${contractId}`, colors.green);
+  log('✓ PASS', `Workload submitted — contract_id: ${contractId ?? '(none — TOP disabled)'}`, colors.green);
   log('  INFO', `TOP sent: ${topResult?.sent ?? false}  |  skipped: ${topResult?.skipped ?? false}`, colors.yellow);
 
-  if (runRes.data.signed_contract) {
-    log('  INFO', 'Signed contract returned inline (TOP was live)', colors.yellow);
+  if (!topResult?.sent && !topResult?.skipped) {
+    log('  WARN', `TOP error: ${JSON.stringify(topResult)}`, colors.yellow);
+  }
+
+  // The response now carries the fully signed contract directly (no separate GET).
+  if (contract) {
+    const sigs = contract.signatures;
+    if (sigs?.consumer_signature) {
+      log('✓ PASS', 'Consumer signature present (HMAC-SHA256 produced by TOP)', colors.green);
+    }
+    if (sigs?.orchestrator_signature) {
+      log('✓ PASS', 'Orchestrator signature present (RSA-PKCS1v15-SHA256 produced by TOP)', colors.green);
+    }
+  } else {
+    log('  INFO', 'No contract in response — TOP was disabled or skipped', colors.yellow);
   }
 
   console.log();
 
-  // ── 3. Retrieve contract record ────────────────────────────────────────────
-  log('STEP-3', `Fetching contract record (GET /p3dx/workloads/contracts/${contractId})...`, colors.blue);
+  // ── 3. Retrieve contract from immuDB ────────────────────────────────────────
+  // p3dx-aaa stores the signed contract in immuDB after receiving it from TOP.
+  // This step verifies that the audit record exists and is retrievable.
+  if (contractId) {
+    log('STEP-3', `Fetching contract record from immuDB (GET /p3dx/workloads/contracts/${contractId})...`, colors.blue);
 
-  const getRes = await axios.get(
-    `${BASE_URL}/p3dx/workloads/contracts/${contractId}`,
-    { headers: authHeaders }
-  );
+    const getRes = await axios.get(
+      `${BASE_URL}/p3dx/workloads/contracts/${contractId}`,
+      { headers: authHeaders }
+    );
 
-  if (getRes.status !== 200 || getRes.data.status !== 'SUCCESS') {
-    log('✗ FAIL', `Unexpected response: ${getRes.status}`, colors.red);
-    process.exit(1);
+    if (getRes.status !== 200 || getRes.data.status !== 'SUCCESS') {
+      log('✗ FAIL', `Unexpected response: ${getRes.status}`, colors.red);
+      process.exit(1);
+    }
+
+    log('✓ PASS', 'Contract record retrieved from immuDB', colors.green);
+  } else {
+    log('STEP-3', 'No contract_id — skipping immuDB retrieval (TOP was disabled)', colors.yellow);
   }
 
-  log('✓ PASS', 'Contract record retrieved from immuDB', colors.green);
   console.log();
 
-  // ── 4. Fetch signed result (only if TOP was live) ──────────────────────────
-  if (topResult?.sent === true) {
+  // ── 4. Fetch workload result from TOP ──────────────────────────────────────
+  // The signed contract is already in the run response, but this step verifies
+  // that TOP's GET /contracts/:id endpoint is working and returns consistent data.
+  if (topResult?.sent === true && contractId) {
     log('STEP-4', `Fetching workload result (GET /p3dx/workloads/contracts/${contractId}/result)...`, colors.blue);
 
     const resultRes = await axios.get(
@@ -133,10 +163,10 @@ async function main() {
 
     const sig = resultRes.data.signed_contract?.signatures;
     if (sig?.orchestrator_signature) {
-      log('✓ PASS', 'Orchestrator signature present in signed contract', colors.green);
+      log('✓ PASS', 'Orchestrator signature confirmed via /result endpoint', colors.green);
     }
   } else {
-    log('STEP-4', 'TOP not live — skipping signed result fetch', colors.yellow);
+    log('STEP-4', 'TOP not live — skipping /result verification', colors.yellow);
   }
 
   console.log();
@@ -144,7 +174,7 @@ async function main() {
   // ── Summary ────────────────────────────────────────────────────────────────
   console.log(`${colors.green}${'═'.repeat(60)}${colors.reset}`);
   log('SUCCESS', '✓ Workload contract test passed', colors.green);
-  console.log(`  contract_id : ${contractId}`);
+  console.log(`  contract_id : ${contractId ?? '(none)'}`);
   console.log(`  dataset     : ${DATASET_ID}`);
   console.log(`  application : ${APPLICATION_ID}`);
   console.log(`  TOP sent    : ${topResult?.sent ?? false}`);

@@ -1,5 +1,4 @@
 import { Router } from 'express';
-import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,8 +20,7 @@ import {
   getRoleRequestById,
   decideRoleRequest,
 } from '../services/roleRequests.service.js';
-import { createWorkloadContract } from '../services/contractGen.service.js';
-import { sendContractToTop } from '../services/top.service.js';
+import { sendWorkloadToTop } from '../services/top.service.js';
 
 const router = Router();
 
@@ -269,8 +267,6 @@ router.post('/workloads/run', verifyJWT, requireRole('user'), async (req, res, n
       return res.status(401).json({ status: 'FAILED', error: 'MISSING_AUTH_TOKEN' });
     }
 
-    const tokenFingerprint = createHash('sha256').update(keycloakToken).digest('hex');
-
     const datasetId = req.body?.datasetId || req.body?.dataset;
     const applicationId = req.body?.applicationId || req.body?.application;
 
@@ -284,117 +280,37 @@ router.post('/workloads/run', verifyJWT, requireRole('user'), async (req, res, n
       user: req.user?.preferred_username || req.user?.sub,
     });
 
-    const contract = await createWorkloadContract({
-      jwt: keycloakToken,
-      datasetId,
-      applicationId,
-    });
-
-    console.log('[P3DX_STEP_OK] workload/run: contract created', {
-      contractId: contract?.contract_id || contract?.contractId,
-      hasSignature: Boolean(contract?.signature || contract?.signatures?.consumer_signature || contract?.signatures?.consumerSignature),
-    });
-
-    const stored = await storeWorkloadContract({
-      contract,
-      datasetId,
-      applicationId,
-      user: req.user,
-      metadata: {
-        ip: req.ip,
-        userAgent: req.get('user-agent'),
-        token_fingerprint: tokenFingerprint,
-      },
-    });
-
-    console.log('[P3DX_STEP_OK] workload/run: contract stored (immudb)', {
-      contractId: contract?.contract_id || contract?.contractId,
-      stored: Boolean(stored?.stored),
-      errorsCount: Array.isArray(stored?.errors) ? stored.errors.length : 0,
-    });
-
-    let topResult = null;
+    // TOP now owns contract creation, consumer signing, policy check, orchestrator
+    // signing, and TEE deployment. We send only the raw workload parameters.
+    let topResult;
     try {
-      topResult = await sendContractToTop({
-        contract,
-        jwt: keycloakToken,
-        datasetId,
-        applicationId,
-        user: req.user,
-      });
+      topResult = await sendWorkloadToTop({ token: keycloakToken, datasetId, applicationId });
 
-      console.log('[P3DX_STEP_OK] workload/run: contract sent to TOP', {
-        contractId: contract?.contract_id || contract?.contractId,
+      console.log('[P3DX_STEP_OK] workload/run: workload sent to TOP', {
         sent: Boolean(topResult?.sent),
         skipped: Boolean(topResult?.skipped),
         status: topResult?.status,
+        contractId: topResult?.data?.contract_id,
       });
-
-      const requiredRaw = process.env.TOP_REQUIRED;
-      const required = typeof requiredRaw === 'string' ? requiredRaw.trim().toLowerCase() : 'false';
-      const requiredBool = required === 'true' || required === '1' || required === 'yes';
-      if (requiredBool && topResult?.skipped !== true && topResult?.sent !== true) {
-        return res.status(502).json({
-          status: 'FAILED',
-          error: 'TOP_SUBMISSION_FAILED',
-          top: topResult,
-        });
-      }
     } catch (err) {
-      const requiredRaw = process.env.TOP_REQUIRED;
-      const required = typeof requiredRaw === 'string' ? requiredRaw.trim().toLowerCase() : 'false';
-      const requiredBool = required === 'true' || required === '1' || required === 'yes';
-
-      topResult = {
-        sent: false,
-        skipped: false,
-        error: err?.message || 'TOP_SUBMISSION_ERROR',
-      };
-
-      if (requiredBool) {
-        return res.status(502).json({
-          status: 'FAILED',
-          error: 'TOP_SUBMISSION_FAILED',
-          top: topResult,
-        });
-      }
+      topResult = { sent: false, skipped: false, error: err?.message || 'TOP_ERROR' };
     }
 
-    let signedContract = null;
-    if (topResult?.sent === true) {
-      const topBaseRaw = process.env.TOP_BASE_URL;
-      const topBase = typeof topBaseRaw === 'string' ? topBaseRaw.trim().replace(/\/+$/, '') : '';
-      if (!topBase) {
-        return res.status(503).json({ status: 'FAILED', error: 'TOP_NOT_CONFIGURED' });
-      }
+    const requiredRaw = process.env.TOP_REQUIRED;
+    const topRequired = ['true', '1', 'yes'].includes(
+      typeof requiredRaw === 'string' ? requiredRaw.trim().toLowerCase() : ''
+    );
 
-      const contractId = contract?.contract_id || contract?.contractId;
-      const url = `${topBase}/contracts/${contractId}`;
-      const upstream = await fetch(url, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
+    if (topRequired && !topResult?.skipped && !topResult?.sent) {
+      return res.status(502).json({ status: 'FAILED', error: 'TOP_SUBMISSION_FAILED', top: topResult });
+    }
 
-      const text = await upstream.text();
-      let data;
-      try {
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        data = null;
-      }
+    // TOP returns the fully signed contract in the response body.
+    // Store it in immuDB as a single audit record.
+    const signedContract = topResult?.data?.contract ?? null;
+    const contractId = topResult?.data?.contract_id ?? null;
 
-      if (!upstream.ok || data?.status !== 'SUCCESS') {
-        return res.status(502).json({
-          status: 'FAILED',
-          error: 'TOP_SIGNED_CONTRACT_FETCH_FAILED',
-          ...(process.env.NODE_ENV === 'production' ? {} : { detail: data || text }),
-        });
-      }
-
-      signedContract = data?.contract;
-
+    if (signedContract) {
       await storeWorkloadContract({
         contract: signedContract,
         datasetId,
@@ -403,18 +319,20 @@ router.post('/workloads/run', verifyJWT, requireRole('user'), async (req, res, n
         metadata: {
           ip: req.ip,
           userAgent: req.get('user-agent'),
-          token_fingerprint: tokenFingerprint,
           top_signed: true,
           top_status: topResult?.status,
         },
       });
 
-      console.log('[P3DX_STEP_OK] workload/run: signed contract fetched from TOP and stored (immudb)', {
-        contractId: contract?.contract_id || contract?.contractId,
-      });
+      console.log('[P3DX_STEP_OK] workload/run: signed contract stored (immudb)', { contractId });
     }
 
-    return res.status(201).json({ status: 'SUCCESS', contract, signed_contract: signedContract, top: topResult });
+    return res.status(201).json({
+      status: 'SUCCESS',
+      contract: signedContract,
+      contract_id: contractId,
+      top: topResult,
+    });
   } catch (err) {
     next(err);
   }
