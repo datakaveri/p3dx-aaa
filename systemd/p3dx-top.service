@@ -1,0 +1,21 @@
+[Unit]
+Description=P3DX TOP server
+After=network.target p3dx-aaa-auth-backend.service p3dx-apd.service
+Wants=p3dx-aaa-auth-backend.service p3dx-apd.service
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/Top
+EnvironmentFile=/home/azureuser/Top/.env
+ExecStartPre=/home/azureuser/.local/go/bin/go build -o /home/azureuser/bin/top-server .
+ExecStart=/home/azureuser/bin/top-server
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

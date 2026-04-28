@@ -1,0 +1,21 @@
+[Unit]
+Description=p3dx APD server
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=azureuser
+Group=azureuser
+WorkingDirectory=/home/azureuser/p3dx-apd
+EnvironmentFile=/home/azureuser/p3dx-apd/.env
+ExecStartPre=/home/azureuser/.local/go/bin/go build -o /home/azureuser/bin/p3dx-apd ./cmd/server/main.go
+ExecStart=/home/azureuser/bin/p3dx-apd
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
