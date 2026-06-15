@@ -225,7 +225,72 @@ Keycloak will prompt you to create the first admin user.
 
 ### 7.3 Roles
 
-- Realm role: `user`
+The following realm roles must exist in the `master` realm:
+
+- `user` — auto-assigned on registration; required to run workloads
+- `data-provider` — granted by admin approval; required to submit dataset policies
+- `application-provider` — granted by admin approval
+- `admin` — granted manually; required to approve/reject role requests in the UI
+
+Create them via Keycloak Admin API (or Admin Console → Realm roles → Create):
+
+```bash
+KC_ADMIN_PASS=<KEYCLOAK_ADMIN_PASSWORD>
+TOKEN=$(curl -s -X POST http://localhost:8080/realms/master/protocol/openid-connect/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=password&client_id=admin-cli&username=keycloak-admin&password=${KC_ADMIN_PASS}" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+for ROLE in user data-provider application-provider; do
+  curl -s -X POST http://localhost:8080/admin/realms/master/roles \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"name\": \"$ROLE\"}"
+done
+```
+
+(`admin` role already exists in master by default.)
+
+### 7.4 Platform admin user
+
+The platform needs one dedicated admin user who can log into the UI and approve/reject role requests. This is separate from the Keycloak admin account.
+
+**Create via p3dx-aaa register endpoint** (backend must be running):
+
+```bash
+curl -s -X POST http://localhost:3001/p3dx/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"Admin","email":"admin@p3dx.local","password":"Admin@123","firstName":"Admin","lastName":"User"}'
+```
+
+**Assign the `admin` realm role** to the new user:
+
+```bash
+# Get user ID
+ADMIN_ID=$(curl -s "http://localhost:8080/admin/realms/master/users?username=Admin&exact=true" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['id'])")
+
+# Get admin role ID
+ADMIN_ROLE_ID=$(curl -s "http://localhost:8080/admin/realms/master/roles/admin" \
+  -H "Authorization: Bearer $TOKEN" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+# Assign
+curl -s -X POST "http://localhost:8080/admin/realms/master/users/$ADMIN_ID/role-mappings/realm" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "[{\"id\":\"$ADMIN_ROLE_ID\",\"name\":\"admin\"}]"
+```
+
+**Current platform admin credentials:**
+
+| Field | Value |
+|---|---|
+| Username | `Admin` |
+| Password | `Admin@123` |
+| Email | `admin@p3dx.local` |
+| Keycloak role | `admin` |
 
 ---
 

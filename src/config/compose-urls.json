@@ -1,6 +1,7 @@
 {
   "compose_urls": {
     "app-1": "https://raw.githubusercontent.com/prathmeshj1729/Docker-Compose/refs/heads/main/docker-compose-skald.yaml",
-    "app-2": "https://raw.githubusercontent.com/prathmeshj1729/Docker-Compose/refs/heads/main/docker-compose-dp.yaml"
+    "app-2": "https://raw.githubusercontent.com/prathmeshj1729/Docker-Compose/refs/heads/main/docker-compose-dp.yaml",
+    "bench-app-001": "https://raw.githubusercontent.com/prathmeshj1729/Docker-Compose/refs/heads/main/docker-compose-skald.yaml"
   }
 }
