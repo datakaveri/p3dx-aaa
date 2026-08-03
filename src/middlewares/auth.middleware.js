@@ -1,9 +1,5 @@
 import { jwtVerify, createRemoteJWKSet } from "jose";
-import { webcrypto } from "crypto";
 import { logAuditEvent } from "../services/immudb.service.js";
-
-// Make crypto available globally for jose
-globalThis.crypto = webcrypto;
 
 let jwks;
 function getJWKS() {

@@ -1,7 +1,9 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getImmuDBClient, logAuditEvent } from './immudb.service.js';
 
-const ALLOWED_ROLES = new Set(['application-provider', 'data-provider']);
+// fl-data-provider is Federated Learning's own data-provider role, kept
+// separate from SMPC's data-provider so granting one never satisfies the other.
+const ALLOWED_ROLES = new Set(['application-provider', 'data-provider', 'output-owner', 'fl-data-provider']);
 
 function ensureAllowedRole(roleName) {
   if (!ALLOWED_ROLES.has(roleName)) {
@@ -52,7 +54,7 @@ function parseEntryValue(entry) {
   }
 }
 
-export async function createRoleRequest({ userId, roleName, requestedBy }) {
+export async function createRoleRequest({ userId, roleName, requestedBy, autoApprove = false }) {
   ensureAllowedRole(roleName);
 
   const client = getImmuDBClient();
@@ -62,29 +64,37 @@ export async function createRoleRequest({ userId, roleName, requestedBy }) {
   }
 
   const existing = await getLatestRoleRequestByUserAndRole({ userId, roleName });
-  if (existing?.status === 'PENDING') {
-    const err = new Error('ROLE_REQUEST_ALREADY_PENDING');
-    err.details = { roleName };
-    throw err;
-  }
-
   if (existing?.status === 'APPROVED') {
     const err = new Error('ROLE_ALREADY_GRANTED');
     err.details = { roleName };
     throw err;
   }
 
+  // Auto-approved requests (Federated Learning) skip the pending gate — a
+  // stale PENDING record from before that behavior existed must not block a
+  // fresh auto-approved request. Everything else (e.g. SMPC) keeps the
+  // original admin-approval workflow: a second request while one is already
+  // PENDING is rejected.
+  if (!autoApprove && existing?.status === 'PENDING') {
+    const err = new Error('ROLE_REQUEST_ALREADY_PENDING');
+    err.details = { roleName };
+    throw err;
+  }
+
   const requestId = uuidv4();
   const timestamp = Date.now();
+  const timestampIso = new Date(timestamp).toISOString();
+  const status = autoApprove ? 'APPROVED' : 'PENDING';
 
   const record = {
     request_id: requestId,
     user_id: userId,
     role_name: roleName,
-    status: 'PENDING',
+    status,
     created_at: timestamp,
-    created_at_iso: new Date(timestamp).toISOString(),
+    created_at_iso: timestampIso,
     requested_by: requestedBy,
+    ...(autoApprove ? { decided_at: timestamp, decided_at_iso: timestampIso, decided_by: requestedBy } : {}),
   };
 
   const json = JSON.stringify(record);
@@ -92,13 +102,13 @@ export async function createRoleRequest({ userId, roleName, requestedBy }) {
   await client.set({ key: `role-request:${requestId}`, value: json });
   await client.set({ key: `role-request:user:${userId}:${requestId}`, value: json });
   await client.set({ key: `role-request:role:${roleName}:${requestId}`, value: json });
-  await client.set({ key: `role-request:status:PENDING:${requestId}`, value: json });
+  await client.set({ key: `role-request:status:${status}:${requestId}`, value: json });
 
-  await logAuditEvent('ROLE_REQUEST_CREATED', userId, {
+  await logAuditEvent(autoApprove ? 'ROLE_REQUEST_AUTO_APPROVED' : 'ROLE_REQUEST_CREATED', userId, {
     requestId,
     roleName,
     requestedBy,
-    timestamp: record.created_at_iso,
+    timestamp: timestampIso,
   });
 
   return record;
