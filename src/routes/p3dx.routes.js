@@ -11,6 +11,7 @@ import {
   getUserId,
   assignUserRole,
   loginUser,
+  refreshAccessToken,
 } from '../services/keycloak.service.js';
 import { getWorkloadContractById, logAuditEvent, storeMaaTokens, storeWorkloadContract } from '../services/immudb.service.js';
 import {
@@ -238,6 +239,27 @@ router.post('/login', async (req, res, next) => {
     });
 
     next(err);
+  }
+});
+
+router.post('/refresh-token', async (req, res, next) => {
+  const { refresh_token: refreshToken } = req.body;
+
+  if (!refreshToken) {
+    return res.status(400).json({ status: 'FAILED', error: 'MISSING_REFRESH_TOKEN' });
+  }
+
+  try {
+    const tokenResponse = await refreshAccessToken(refreshToken);
+
+    return res.json({
+      status: 'SUCCESS',
+      access_token: tokenResponse.access_token,
+      refresh_token: tokenResponse.refresh_token,
+      expires_in: tokenResponse.expires_in,
+    });
+  } catch (err) {
+    return res.status(401).json({ status: 'FAILED', error: 'REFRESH_FAILED' });
   }
 });
 
@@ -584,6 +606,13 @@ router.post('/policy', verifyJWT, requireRole('user'), async (req, res, next) =>
   }
 });
 
+// Roles requestable straight from the Federated Learning flow auto-approve on
+// submit (no admin step). fl-data-provider is FL's own role, kept distinct
+// from SMPC's data-provider so the two are never granted by the same request.
+// Every other role (SMPC's application-provider/data-provider) keeps the
+// original admin-approval workflow regardless of what a client sends.
+const AUTO_APPROVABLE_ROLES = new Set(['output-owner', 'fl-data-provider']);
+
 router.post('/role-requests', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {
     const roleName = req.body?.role || req.body?.role_name;
@@ -596,11 +625,21 @@ router.post('/role-requests', verifyJWT, requireRole('user'), async (req, res, n
       return res.status(409).json({ status: 'FAILED', error: 'ROLE_ALREADY_GRANTED' });
     }
 
+    const autoApprove = AUTO_APPROVABLE_ROLES.has(roleName) && req.body?.auto_approve === true;
+
     const created = await createRoleRequest({
       userId: req.user.sub,
       roleName,
       requestedBy: req.user.preferred_username || req.user.sub,
+      autoApprove,
     });
+
+    if (autoApprove) {
+      // Grant the Keycloak realm role immediately instead of waiting on an
+      // admin decision.
+      const adminToken = await getAdminToken();
+      await assignRealmRole(created.user_id, created.role_name, adminToken);
+    }
 
     return res.status(201).json({ status: 'SUCCESS', request: created });
   } catch (err) {

@@ -179,3 +179,25 @@ export async function loginUser(username, password) {
 
   return response.data;
 }
+
+/**
+ * Exchange a refresh token for a new access token. Keycloak recomputes
+ * realm_access.roles at issuance, so this is how a client picks up a role
+ * granted after the current access token was issued, without a full re-login.
+ */
+export async function refreshAccessToken(refreshToken) {
+  const { baseUrl, realm, clientId, clientSecret } = getKeycloakConfig();
+  const url = `${baseUrl}/realms/${realm}/protocol/openid-connect/token`;
+
+  const params = new URLSearchParams();
+  params.append('grant_type', 'refresh_token');
+  params.append('client_id', clientId);
+  params.append('client_secret', clientSecret);
+  params.append('refresh_token', refreshToken);
+
+  const response = await axios.post(url, params, {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+  });
+
+  return response.data;
+}
