@@ -13,7 +13,7 @@ import {
   loginUser,
   refreshAccessToken,
 } from '../services/keycloak.service.js';
-import { getWorkloadContractById, logAuditEvent, storeMaaTokens, storeWorkloadContract } from '../services/immudb.service.js';
+import { getWorkloadContractById, logAuditEvent, storeMaaTokens, storeWorkloadContract, storeRunHistory, storeAgentHistory, storeChatHistory } from '../services/immudb.service.js';
 import {
   createRoleRequest,
   listRoleRequests,
@@ -717,5 +717,50 @@ router.post(
     }
   }
 );
+
+// Spider → backend: store anonymisation run history
+router.post('/run-history', async (req, res, next) => {
+  try {
+    const body = req.body;
+    if (!body || typeof body !== 'object') {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_BODY' });
+    }
+
+    const stored = await storeRunHistory(body);
+    return res.status(201).json({ status: 'SUCCESS', record: stored });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Spider → backend: store agent analysis history
+router.post('/agent-history', async (req, res, next) => {
+  try {
+    const body = req.body;
+    if (!body || typeof body !== 'object') {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_BODY' });
+    }
+
+    const stored = await storeAgentHistory(body);
+    return res.status(201).json({ status: 'SUCCESS', record: stored });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Spider → backend: store chat history
+router.post('/chat-history', async (req, res, next) => {
+  try {
+    const body = req.body;
+    if (!body || typeof body !== 'object') {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_BODY' });
+    }
+
+    const stored = await storeChatHistory(body);
+    return res.status(201).json({ status: 'SUCCESS', record: stored });
+  } catch (err) {
+    next(err);
+  }
+});
 
 export default router;

@@ -288,6 +288,74 @@ export function getImmuDBClient() {
   return client;
 }
 
+export async function storeRunHistory(record) {
+  if (!client) {
+    console.warn('⚠ immuDB not initialized, skipping run-history storage');
+    return null;
+  }
+
+  const id = uuidv4();
+  const entry = { id, ...record };
+  const json = JSON.stringify(entry);
+
+  try {
+    await client.set({ key: `run-history:${id}`, value: json });
+    await client.set({ key: `run-history:user:${record.username}:${id}`, value: json });
+    await client.set({ key: `run-history:time:${Date.now()}:${id}`, value: json });
+    console.log(`✓ run-history stored [${id}]`);
+    return entry;
+  } catch (err) {
+    console.error(`✗ Failed to store run-history: ${err.message}`);
+    return entry;
+  }
+}
+
+export async function storeAgentHistory(record) {
+  if (!client) {
+    console.warn('⚠ immuDB not initialized, skipping agent-history storage');
+    return null;
+  }
+
+  const id = uuidv4();
+  const entry = { id, ...record };
+  const json = JSON.stringify(entry);
+
+  try {
+    await client.set({ key: `agent-history:${id}`, value: json });
+    await client.set({ key: `agent-history:user:${record.username}:${id}`, value: json });
+    await client.set({ key: `agent-history:session:${record.session_id}:${id}`, value: json });
+    await client.set({ key: `agent-history:time:${Date.now()}:${id}`, value: json });
+    console.log(`✓ agent-history stored [${id}]`);
+    return entry;
+  } catch (err) {
+    console.error(`✗ Failed to store agent-history: ${err.message}`);
+    return entry;
+  }
+}
+
+export async function storeChatHistory(record) {
+  if (!client) {
+    console.warn('⚠ immuDB not initialized, skipping chat-history storage');
+    return null;
+  }
+
+  const id = uuidv4();
+  const entry = { id, ...record };
+  const json = JSON.stringify(entry);
+
+  try {
+    await client.set({ key: `chat-history:${id}`, value: json });
+    await client.set({ key: `chat-history:user:${record.username}:${id}`, value: json });
+    await client.set({ key: `chat-history:session:${record.session_id}:${id}`, value: json });
+    await client.set({ key: `chat-history:time:${Date.now()}:${id}`, value: json });
+    console.log(`✓ chat-history stored [${id}]`);
+    return entry;
+  } catch (err) {
+    console.error(`✗ Failed to store chat-history: ${err.message}`);
+    return entry;
+  }
+}
+
 export async function storeWorkloadContract({ contract, datasetId, applicationId, user, metadata = {} }) {
   const errors = [];
 
