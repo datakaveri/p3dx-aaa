@@ -61,6 +61,7 @@ export async function createUser(user, adminToken) {
       lastName: user.lastName,
       enabled: true,
       emailVerified: true,
+      requiredActions: [],
       credentials: [
         {
           type: 'password',
@@ -156,6 +157,46 @@ export async function assignRealmRole(userId, roleName, adminToken) {
  */
 export async function assignUserRole(userId, adminToken) {
   await assignRealmRole(userId, 'user', adminToken);
+}
+
+/**
+ * Fetch the full user representation by Keycloak user ID.
+ */
+export async function getUserById(userId, adminToken) {
+  const { baseUrl, realm } = getKeycloakConfig();
+  const url = `${baseUrl}/admin/realms/${realm}/users/${userId}`;
+
+  const response = await axios.get(url, {
+    headers: { Authorization: `Bearer ${adminToken}` },
+  });
+
+  return response.data;
+}
+
+/**
+ * Set a single custom attribute on a user's Keycloak profile (e.g. a
+ * data-provider public key). Merges into the user's existing attributes
+ * rather than replacing them, and re-sends the full user representation
+ * since Keycloak's user PUT does not do a partial attribute merge itself.
+ */
+export async function setUserAttribute(userId, attributeName, attributeValue, adminToken) {
+  const { baseUrl, realm } = getKeycloakConfig();
+  const user = await getUserById(userId, adminToken);
+
+  const attributes = { ...(user.attributes || {}) };
+  attributes[attributeName] = [attributeValue];
+
+  const url = `${baseUrl}/admin/realms/${realm}/users/${userId}`;
+  await axios.put(
+    url,
+    { ...user, attributes },
+    {
+      headers: {
+        Authorization: `Bearer ${adminToken}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
 }
 
 /**
