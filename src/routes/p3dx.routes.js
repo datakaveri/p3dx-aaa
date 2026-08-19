@@ -22,6 +22,12 @@ import {
   decideRoleRequest,
 } from '../services/roleRequests.service.js';
 import { sendWorkloadToTop } from '../services/top.service.js';
+import {
+  KEY_PAIR_ROLES,
+  provisionDataProviderKeyPair,
+  getPrivateKeyRecord,
+  recordPrivateKeyDownload,
+} from '../services/keyPair.service.js';
 
 const router = Router();
 
@@ -639,6 +645,14 @@ router.post('/role-requests', verifyJWT, requireRole('user'), async (req, res, n
       // admin decision.
       const adminToken = await getAdminToken();
       await assignRealmRole(created.user_id, created.role_name, adminToken);
+
+      if (KEY_PAIR_ROLES.has(created.role_name)) {
+        try {
+          await provisionDataProviderKeyPair({ userId: created.user_id, roleName: created.role_name });
+        } catch (err) {
+          console.error('[keypair] Failed to provision data-provider key pair:', err.message);
+        }
+      }
     }
 
     return res.status(201).json({ status: 'SUCCESS', request: created });
@@ -705,6 +719,14 @@ router.post(
       if (String(decision).toUpperCase() === 'APPROVE') {
         const adminToken = await getAdminToken();
         await assignRealmRole(updated.user_id, updated.role_name, adminToken);
+
+        if (KEY_PAIR_ROLES.has(updated.role_name)) {
+          try {
+            await provisionDataProviderKeyPair({ userId: updated.user_id, roleName: updated.role_name });
+          } catch (err) {
+            console.error('[keypair] Failed to provision data-provider key pair:', err.message);
+          }
+        }
       }
 
       return res.json({ status: 'SUCCESS', request: updated });
@@ -717,5 +739,67 @@ router.post(
     }
   }
 );
+
+// Whether a data-provider key pair exists for the caller. One key pair is
+// shared across both data-provider roles, so the lookup is per-user — the
+// :roleName segment is kept in the URL only to gate on the caller actually
+// holding that role. Lets the UI decide whether to show the "Download
+// Private Key" button.
+router.get('/keys/:roleName/status', verifyJWT, requireRole('user'), async (req, res, next) => {
+  try {
+    const roleName = req.params.roleName;
+    if (!KEY_PAIR_ROLES.has(roleName)) {
+      return res.status(400).json({ status: 'FAILED', error: 'ROLE_NOT_ALLOWED' });
+    }
+
+    const record = await getPrivateKeyRecord({ userId: req.user.sub });
+    return res.json({
+      status: 'SUCCESS',
+      exists: Boolean(record),
+      download_count: record?.download_count || 0,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Private key download. The key is streamed straight to the response as a
+// file attachment (never returned as JSON, never rendered) and stays
+// available for repeat downloads — the user may lose the file, switch
+// machines, etc. Each download is still audit-logged. The same private key
+// is served regardless of which data-provider role's URL is used, since
+// both roles share one key pair for a given user.
+router.get('/keys/:roleName/private-key', verifyJWT, requireRole('user'), async (req, res, next) => {
+  try {
+    const roleName = req.params.roleName;
+    if (!KEY_PAIR_ROLES.has(roleName)) {
+      return res.status(400).json({ status: 'FAILED', error: 'ROLE_NOT_ALLOWED' });
+    }
+
+    const roles = req.user?.realm_access?.roles || [];
+    if (!roles.includes(roleName)) {
+      return res.status(403).json({ status: 'FAILED', error: 'INSUFFICIENT_ROLE' });
+    }
+
+    const record = await getPrivateKeyRecord({ userId: req.user.sub });
+    if (!record || !record.private_key_pem) {
+      return res.status(404).json({ status: 'FAILED', error: 'KEY_NOT_FOUND' });
+    }
+
+    await recordPrivateKeyDownload({ userId: req.user.sub });
+
+    await logAuditEvent('DATA_PROVIDER_PRIVATE_KEY_DOWNLOADED', req.user.sub, {
+      roleName,
+      ip: req.ip,
+      timestamp: new Date().toISOString(),
+    });
+
+    res.setHeader('Content-Type', 'application/x-pem-file');
+    res.setHeader('Content-Disposition', `attachment; filename="data-provider-private-key.pem"`);
+    return res.status(200).send(record.private_key_pem);
+  } catch (err) {
+    next(err);
+  }
+});
 
 export default router;
