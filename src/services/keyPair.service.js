@@ -7,24 +7,21 @@ import { getAdminToken, setUserAttribute } from './keycloak.service.js';
 // already declared there.
 const PUBLIC_KEY_ATTRIBUTE = 'public-key';
 
-export const KEY_PAIR_ROLES = new Set(['data-provider', 'fl-data-provider']);
+export const KEY_PAIR_ROLES = new Set(['data-provider']);
 
-// One key pair per USER, not per role: a user can hold both SMPC's
-// data-provider and FL's fl-data-provider, and Keycloak only has one
-// "public-key" attribute slot, so both roles must share the same key pair —
-// otherwise the second role granted would silently overwrite the first
-// role's public key in Keycloak while its already-issued private key stayed
-// on the user's disk, leaving a mismatched pair.
+// One key pair per USER: Keycloak only has one "public-key" attribute slot,
+// so a returning data-provider always reuses their existing key pair rather
+// than generating a new one and overwriting the public key while the old
+// private key stays on disk, leaving a mismatched pair.
 function keyStoreKey(userId) {
   return `dp-keypair:${userId}`;
 }
 
 /**
- * Ensure a data-provider key pair exists for this user, right after a
- * data-provider role (SMPC's or FL's) is granted. If the user already has a
- * key pair (from the other role), it's reused as-is — the public key is
- * already on their Keycloak profile — so both roles always see the same
- * key. Otherwise a fresh RSA pair is generated: the public half published to
+ * Ensure a data-provider key pair exists for this user, right after the
+ * data-provider role is granted. If the user already has a key pair, it's
+ * reused as-is — the public key is already on their Keycloak profile.
+ * Otherwise a fresh RSA pair is generated: the public half published to
  * Keycloak immediately, the private half held in immuDB (never logged,
  * never returned from a list endpoint, never rendered).
  */

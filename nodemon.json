@@ -1,0 +1,6 @@
+{
+  "watch": ["src"],
+  "ext": "js,mjs,cjs,json",
+  "legacyWatch": true,
+  "delay": "300"
+}
