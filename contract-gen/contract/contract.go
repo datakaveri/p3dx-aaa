@@ -84,6 +84,7 @@ type Contract struct {
 	ContractID               string                   `json:"contract_id"`
 	Version                  int                      `json:"version"`
 	Description              string                   `json:"description"`
+	Technique                string                   `json:"technique"` // "FL" | "TEE" | "SMPC"
 	Lifecycle                Lifecycle                `json:"lifecycle"`
 	ExecutionType            string                   `json:"execution_type"`
 	ExecutionPlatform        string                   `json:"execution_platform"`

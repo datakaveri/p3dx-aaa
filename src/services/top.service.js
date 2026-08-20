@@ -83,6 +83,34 @@ export async function sendWorkloadToTop({ token, datasetId, applicationId }) {
   };
 }
 
+// Contract generation now happens in gov_layer itself (POST /generate-contract),
+// not in this service. Unlike sendWorkloadToTop/sendContractToTop, this call is
+// NOT gated behind TOP_ENABLED — it's the core generation path, not optional
+// forwarding. Returns the unsigned contract for display; nothing is
+// signed/stored/deployed by this call.
+export async function generateContractFromGovLayer({ token, datasetId, datasetName, applicationId, technique }) {
+  const url = buildTopUrl('/generate-contract');
+  const headers = buildTopHeaders({ jwt: token });
+
+  const resp = await axios.post(
+    url,
+    {
+      dataset_id: datasetId,
+      dataset_name: datasetName,
+      application_id: applicationId,
+      technique,
+    },
+    { headers, timeout: 10000, validateStatus: () => true }
+  );
+
+  if (resp.status < 200 || resp.status >= 300) {
+    const msg = resp.data?.error || resp.data?.message || `gov_layer returned status ${resp.status}`;
+    throw new Error(msg);
+  }
+
+  return resp.data?.contract;
+}
+
 export async function sendContractToTop({ contract, jwt }) {
   const enabledRaw = process.env.TOP_ENABLED;
   const enabled = typeof enabledRaw === 'string' ? enabledRaw.trim().toLowerCase() : 'false';

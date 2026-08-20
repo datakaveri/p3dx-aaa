@@ -27,8 +27,11 @@ type input struct {
 	JWT           string     `json:"jwt"`
 	DatasetID     string     `json:"datasetId"`
 	ApplicationID string     `json:"applicationId"`
+	Technique     string     `json:"technique"`
 	Overrides     *overrides `json:"overrides,omitempty"`
 }
+
+var validTechniques = map[string]bool{"FL": true, "TEE": true, "SMPC": true}
 
 type overrides struct {
 	ContractID               *string                            `json:"contract_id,omitempty"`
@@ -92,6 +95,9 @@ func readInput(r io.Reader) (input, error) {
 	if strings.TrimSpace(in.ApplicationID) == "" {
 		return input{}, errors.New("applicationId is required")
 	}
+	if !validTechniques[strings.TrimSpace(in.Technique)] {
+		return input{}, fmt.Errorf("technique must be one of FL, TEE, SMPC (got %q)", in.Technique)
+	}
 	return in, nil
 }
 
@@ -119,6 +125,7 @@ func main() {
 		ContractID:  uuid.NewString(),
 		Version:     1,
 		Description: fmt.Sprintf("workload dataset=%s application=%s", in.DatasetID, in.ApplicationID),
+		Technique:   strings.TrimSpace(in.Technique),
 
 		Lifecycle: contract.Lifecycle{
 			CreatedAt:  created,

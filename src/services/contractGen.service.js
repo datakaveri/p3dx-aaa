@@ -64,7 +64,7 @@ function parseJsonFromStdout(stdout) {
   }
 }
 
-export async function createWorkloadContract({ jwt, datasetId, applicationId }) {
+export async function createWorkloadContract({ jwt, datasetId, applicationId, technique }) {
   const contractGenBinRaw = process.env.CONTRACT_GEN_BIN;
   const contractGenBin = typeof contractGenBinRaw === 'string' ? contractGenBinRaw.trim() : '';
 
@@ -82,6 +82,7 @@ export async function createWorkloadContract({ jwt, datasetId, applicationId }) 
     jwt,
     datasetId,
     applicationId,
+    technique,
     ...(overrides ? { overrides } : {}),
   };
 
