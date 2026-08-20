@@ -5,6 +5,7 @@ import { createHash } from 'crypto';
 const ImmudbClient = pkg.default;
 
 let client;
+let initializationComplete = false;
 
 async function scanAllByPrefix(prefix) {
   const results = [];
@@ -46,6 +47,7 @@ export async function initImmuDB() {
   if (!host || !portRaw || Number.isNaN(port) || !user || !password) {
     client = null;
     console.warn('⚠ immuDB env not fully configured. Audit logging will be console-only.');
+    initializationComplete = true;
     return;
   }
 
@@ -85,6 +87,12 @@ export async function initImmuDB() {
     console.warn('⚠ immuDB connection/login failed. Audit logging will be console-only.');
     console.warn(`  ${err.message}`);
   }
+
+  initializationComplete = true;
+}
+
+export function isImmuDBInitialized() {
+  return initializationComplete;
 }
 
 /**
