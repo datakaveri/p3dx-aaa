@@ -21,7 +21,14 @@ import {
   getRoleRequestById,
   decideRoleRequest,
 } from '../services/roleRequests.service.js';
-import { sendWorkloadToTop, generateContractFromGovLayer } from '../services/top.service.js';
+import {
+  sendWorkloadToTop,
+  generateContractFromGovLayer,
+  startTeeSession,
+  getTeeSessionStatus,
+  downloadTeeSessionOutput,
+  terminateTeeSession,
+} from '../services/top.service.js';
 import {
   KEY_PAIR_ROLES,
   provisionDataProviderKeyPair,
@@ -406,6 +413,96 @@ router.post('/workloads/preview-contract', verifyJWT, requireRole('user'), async
 
     return res.status(200).json({ status: 'SUCCESS', contract });
   } catch (err) {
+    next(err);
+  }
+});
+
+// Starts a real TEE session — gov_layer's POST /v1/tee/sessions sequences
+// provision -> attest -> run -> poll -> output against the actual
+// confidential VM in the background and returns a sessionId immediately;
+// poll /workloads/tee-sessions/:sessionId for progress. datasetUrl must be an
+// https URL the CVM's managed identity can read.
+router.post('/workloads/tee-sessions', verifyJWT, requireRole('user'), async (req, res, next) => {
+  try {
+    const { datasetUrl, datasetId, datasetName } = req.body || {};
+    if (!datasetUrl || typeof datasetUrl !== 'string') {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_DATASET_URL' });
+    }
+    let parsed;
+    try {
+      parsed = new URL(datasetUrl);
+    } catch {
+      return res.status(400).json({ status: 'FAILED', error: 'INVALID_DATASET_URL' });
+    }
+    if (parsed.protocol !== 'https:') {
+      return res.status(400).json({ status: 'FAILED', error: 'DATASET_URL_MUST_BE_HTTPS' });
+    }
+
+    const result = await startTeeSession({
+      datasetUrl,
+      datasetId,
+      datasetName,
+      consumerId: req.user?.preferred_username || req.user?.sub,
+    });
+
+    console.log('[P3DX_STEP_OK] workloads/tee-sessions: TEE session started', {
+      sessionId: result?.sessionId,
+      user: req.user?.preferred_username || req.user?.sub,
+    });
+
+    return res.status(202).json(result);
+  } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({ status: 'FAILED', error: err.message });
+    }
+    next(err);
+  }
+});
+
+// Polls the status of a TEE session started via /workloads/tee-sessions.
+router.get('/workloads/tee-sessions/:sessionId', verifyJWT, requireRole('user'), async (req, res, next) => {
+  try {
+    const result = await getTeeSessionStatus({ sessionId: req.params.sessionId });
+    return res.status(200).json(result);
+  } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({ status: 'FAILED', error: err.message });
+    }
+    next(err);
+  }
+});
+
+// Downloads the anonymized output of a completed TEE session, streamed
+// through from gov_layer as a file attachment.
+router.get('/workloads/tee-sessions/:sessionId/output', verifyJWT, requireRole('user'), async (req, res, next) => {
+  try {
+    const { data, contentType, contentDisposition } = await downloadTeeSessionOutput({
+      sessionId: req.params.sessionId,
+    });
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader(
+      'Content-Disposition',
+      contentDisposition || `attachment; filename="anonymized-${req.params.sessionId}.bin"`
+    );
+    return res.status(200).send(data);
+  } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({ status: 'FAILED', error: err.message });
+    }
+    next(err);
+  }
+});
+
+// Terminates a TEE session's confidential VM so it stops billing compute.
+router.delete('/workloads/tee-sessions/:sessionId', verifyJWT, requireRole('user'), async (req, res, next) => {
+  try {
+    const result = await terminateTeeSession({ sessionId: req.params.sessionId });
+    return res.status(200).json(result);
+  } catch (err) {
+    if (err.status) {
+      return res.status(err.status).json({ status: 'FAILED', error: err.message });
+    }
     next(err);
   }
 });

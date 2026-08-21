@@ -1,4 +1,19 @@
 import axios from 'axios';
+import { v4 as uuidv4 } from 'uuid';
+
+// The TEE orchestrator API (POST /v1/tee/...) is mounted at gov_layer's
+// server root, not under /api/v1 like buildTopUrl below — see
+// p3dx_gov_layer/internal/httpapi/server.go's Handler().
+function buildOrchestratorUrl(pathname) {
+  const baseRaw = process.env.TEE_ORCHESTRATOR_URL;
+  const base = typeof baseRaw === 'string' ? baseRaw.trim() : '';
+  if (!base) {
+    throw new Error('TEE_ORCHESTRATOR_URL_NOT_SET');
+  }
+  const trimmedBase = base.endsWith('/') ? base.slice(0, -1) : base;
+  const path = pathname.startsWith('/') ? pathname : `/${pathname}`;
+  return `${trimmedBase}${path}`;
+}
 
 function buildTopUrl(pathname) {
   const baseUrlRaw = process.env.TOP_BASE_URL;
@@ -13,6 +28,19 @@ function buildTopUrl(pathname) {
   const base = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
   const ep = endpoint.startsWith('/') ? endpoint.slice(1) : endpoint;
   return `${base}${ep}`;
+}
+
+// gov_layer's error responses are usually plain text (Go's http.Error), not
+// JSON — axios still puts that string in resp.data. Handle both shapes so
+// the real error reaches the browser instead of a generic "status N".
+function govLayerErrorMessage(resp) {
+  if (resp.data && typeof resp.data === 'object') {
+    return resp.data.error || resp.data.message || `gov_layer returned status ${resp.status}`;
+  }
+  if (typeof resp.data === 'string' && resp.data.trim()) {
+    return resp.data.trim();
+  }
+  return `gov_layer returned status ${resp.status}`;
 }
 
 function buildTopHeaders({ jwt }) {
@@ -104,11 +132,141 @@ export async function generateContractFromGovLayer({ token, datasetId, datasetNa
   );
 
   if (resp.status < 200 || resp.status >= 300) {
-    const msg = resp.data?.error || resp.data?.message || `gov_layer returned status ${resp.status}`;
-    throw new Error(msg);
+    throw new Error(govLayerErrorMessage(resp));
   }
 
   return resp.data?.contract;
+}
+
+// Builds the TEEContract shape gov_layer's POST /v1/tee/provision (and
+// /v1/tee/sessions) expects — mirrors p3dx_gov_layer/internal/services/
+// tee_contract.go's json tags field-for-field, which itself mirrors p3dx-apd's
+// domain.Contract. appDetails.imageId/imageHash are required by
+// ValidateTEEContract but aren't compared against anything on this demo path
+// (see that file's comments), so demo placeholders are fine here.
+function buildTeeContract({ datasetUrl, datasetId, datasetName, consumerId }) {
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 30 * 60 * 1000); // 30-minute run window
+  return {
+    contractId: uuidv4(),
+    requestId: uuidv4(),
+    consumerId: consumerId || 'demo-consumer',
+    providerId: 'demo-provider',
+    appDetails: {
+      imageId: 'skald-anonymizer',
+      imageHash: 'unpinned-demo-measurement',
+      version: '1.0',
+    },
+    datasetDetails: {
+      itemId: datasetId || 'demo-dataset',
+      assetName: datasetName || datasetId || 'demo-dataset',
+      assetType: 'dataset',
+      resourceUrl: datasetUrl,
+    },
+    accessConfig: { type: 'read' },
+    consumerPublicKey: '',
+    apdCallbackUrl: '',
+    issuedAt: now.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+  };
+}
+
+function orchestratorErrorMessage(resp) {
+  if (resp.data && typeof resp.data === 'object') {
+    return resp.data.message || resp.data.error || `orchestrator returned status ${resp.status}`;
+  }
+  if (typeof resp.data === 'string' && resp.data.trim()) {
+    return resp.data.trim();
+  }
+  return `orchestrator returned status ${resp.status}`;
+}
+
+// Starts a TEE run session — gov_layer sequences
+// provision -> attest -> run -> poll -> output in the background (see
+// POST /v1/tee/sessions in p3dx_gov_layer/internal/httpapi/tee_session.go)
+// and returns immediately with a session id to poll; provisioning alone can
+// take minutes (cold confidential-VM boot).
+export async function startTeeSession({ datasetUrl, datasetId, datasetName, consumerId }) {
+  const contract = buildTeeContract({ datasetUrl, datasetId, datasetName, consumerId });
+  const url = buildOrchestratorUrl('/v1/tee/sessions');
+
+  const resp = await axios.post(url, contract, {
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 15000,
+    validateStatus: () => true,
+  });
+
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(orchestratorErrorMessage(resp));
+    err.status = resp.status;
+    throw err;
+  }
+
+  return resp.data;
+}
+
+// Polls a TEE session's status (GET /v1/tee/sessions/{sessionId}).
+export async function getTeeSessionStatus({ sessionId }) {
+  const url = buildOrchestratorUrl(`/v1/tee/sessions/${encodeURIComponent(sessionId)}`);
+
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
+
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(orchestratorErrorMessage(resp));
+    err.status = resp.status;
+    throw err;
+  }
+
+  return resp.data;
+}
+
+// Fetches the anonymized output of a completed session
+// (GET /v1/tee/sessions/{sessionId}/output) as a raw buffer to stream back
+// to the browser, along with the content type gov_layer served it as.
+export async function downloadTeeSessionOutput({ sessionId }) {
+  const url = buildOrchestratorUrl(`/v1/tee/sessions/${encodeURIComponent(sessionId)}/output`);
+
+  const resp = await axios.get(url, {
+    timeout: 30000,
+    responseType: 'arraybuffer',
+    validateStatus: () => true,
+  });
+
+  if (resp.status < 200 || resp.status >= 300) {
+    const bodyText = Buffer.from(resp.data).toString('utf8');
+    let message = bodyText.trim() || `orchestrator returned status ${resp.status}`;
+    try {
+      const parsed = JSON.parse(bodyText);
+      message = parsed?.message || parsed?.error || message;
+    } catch {
+      // response wasn't JSON — the raw text set above is the message
+    }
+    const err = new Error(message);
+    err.status = resp.status;
+    throw err;
+  }
+
+  return {
+    data: Buffer.from(resp.data),
+    contentType: resp.headers['content-type'] || 'application/octet-stream',
+    contentDisposition: resp.headers['content-disposition'],
+  };
+}
+
+// Terminates a session's TEE instance (DELETE /v1/tee/sessions/{sessionId}) —
+// deallocates the confidential VM so it stops billing compute.
+export async function terminateTeeSession({ sessionId }) {
+  const url = buildOrchestratorUrl(`/v1/tee/sessions/${encodeURIComponent(sessionId)}`);
+
+  const resp = await axios.delete(url, { timeout: 30000, validateStatus: () => true });
+
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(orchestratorErrorMessage(resp));
+    err.status = resp.status;
+    throw err;
+  }
+
+  return resp.data;
 }
 
 export async function sendContractToTop({ contract, jwt }) {
