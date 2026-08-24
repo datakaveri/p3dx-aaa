@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
+import { requireRole } from '../middlewares/role.middleware.js';
 import {
   createOutputOwnerSubmission,
   createDataProviderForm,
@@ -98,7 +99,7 @@ router.get('/available-datasets', verifyJWT, async (req, res, next) => {
   }
 });
 
-router.post('/data-provider-forms', verifyJWT, async (req, res, next) => {
+router.post('/data-provider-forms', verifyJWT, requireRole('data-provider'), async (req, res, next) => {
   try {
     const payload = req.body?.payload;
     if (!payload) {

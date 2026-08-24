@@ -143,7 +143,9 @@ export async function generateContractFromGovLayer({ token, datasetId, datasetNa
 // tee_contract.go's json tags field-for-field, which itself mirrors p3dx-apd's
 // domain.Contract. appDetails.imageId/imageHash are required by
 // ValidateTEEContract but aren't compared against anything on this demo path
-// (see that file's comments), so demo placeholders are fine here.
+// (see that file's comments), so demo placeholders are fine here. Both the
+// TEE and SMPC catalogue entry points call startTeeSession and get this same
+// skald-anonymizer image — there's no separate SMPC workload image yet.
 function buildTeeContract({ datasetUrl, datasetId, datasetName, consumerId }) {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + 30 * 60 * 1000); // 30-minute run window

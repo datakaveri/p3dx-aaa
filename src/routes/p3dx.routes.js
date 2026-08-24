@@ -172,7 +172,12 @@ router.get(
 
       const contract = record?.contract || record?.stored?.contract || record?.stored?.value?.contract;
       const contractObj = contract && typeof contract === 'object' ? contract : null;
-      const appId = contractObj?.application_provider_terms?.app_id;
+      // Governance layer's unified contract schema nests application providers
+      // under parties.application_providers[] rather than a singular
+      // application_provider_terms object; app_name is the closest analog to
+      // the old app_id (falls back to id when app_name isn't set).
+      const appProvider = contractObj?.parties?.application_providers?.[0];
+      const appId = appProvider?.app_name || appProvider?.id;
 
       const topBaseRaw = process.env.TOP_BASE_URL;
       const topBase = typeof topBaseRaw === 'string' ? topBaseRaw.trim().replace(/\/+$/, '') : '';
