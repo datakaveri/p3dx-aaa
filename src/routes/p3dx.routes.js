@@ -28,6 +28,11 @@ import {
   getTeeSessionStatus,
   downloadTeeSessionOutput,
   terminateTeeSession,
+  sendParticipationNotifications,
+  getRecipientNotifications,
+  getSentNotifications,
+  markParticipationNotificationRead,
+  respondToParticipationNotification,
 } from '../services/top.service.js';
 import {
   KEY_PAIR_ROLES,
@@ -920,6 +925,128 @@ router.get('/keys/:roleName/private-key', verifyJWT, requireRole('user'), async 
     res.setHeader('Content-Type', 'application/x-pem-file');
     res.setHeader('Content-Disposition', `attachment; filename="data-provider-private-key.pem"`);
     return res.status(200).send(record.private_key_pem);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Participation-consent notifications — proxied through to gov_layer's
+// fl_notifications.go (POST /notifications etc.), which itself takes no auth
+// token, so verifyJWT here is the only gate. Usernames for the recipient's
+// own actions (read/respond) are always taken from the verified token, never
+// from the request body, so a provider can't act as someone else.
+
+// POST /notify-providers — output owner sends (or re-sends) a participation
+// message to every selected data provider. The payload carries the full
+// selected roster plus whichever of them have already responded "willing"
+// (accepted so far), so providers always see live status alongside their
+// accept/decline prompt (see FederatedLearningDashboard.jsx's isRequest
+// rendering). Accepting also signs that provider's party on the session's
+// contract (p3dx_gov_layer db.SignDataProviderParty).
+router.post('/notify-providers', verifyJWT, async (req, res, next) => {
+  try {
+    const { selected_providers, requested_providers, willing_providers, output_owner_id, submission_id } = req.body || {};
+    if (!Array.isArray(selected_providers) || selected_providers.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_SELECTED_PROVIDERS' });
+    }
+
+    const senderUsername = req.user?.preferred_username || output_owner_id;
+    const recipients = selected_providers
+      .filter(p => p && p.id && p.username)
+      .map(p => ({ id: p.id, username: p.username }));
+    if (recipients.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'SELECTED_PROVIDERS_MISSING_ID_OR_USERNAME' });
+    }
+
+    const willingCount = Array.isArray(willing_providers) ? willing_providers.length : 0;
+    const message = `${senderUsername} selected ${selected_providers.length} data provider(s)` +
+      (submission_id ? ` for session ${submission_id}` : ' for a federated learning session') +
+      ` — ${willingCount} confirmed willing so far.`;
+
+    const result = await sendParticipationNotifications({
+      recipients,
+      senderUsername,
+      message,
+      payload: {
+        kind: 'participation_request',
+        submission_id,
+        output_owner_id: output_owner_id || senderUsername,
+        selected_providers,
+        requested_providers: Array.isArray(requested_providers) && requested_providers.length ? requested_providers : selected_providers,
+        willing_providers: Array.isArray(willing_providers) ? willing_providers : [],
+      },
+    });
+
+    console.log('[P3DX_STEP_OK] notify-providers: sent', {
+      sender: senderUsername, recipients: recipients.length, submission_id,
+    });
+    return res.status(201).json({ status: 'SUCCESS', created: result?.created ?? recipients.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /notification-responses — output owner reads back the participation
+// responses (accepted/declined) for notifications they've sent, so the
+// frontend can compute the "willing" subset before the next Send Message.
+router.get('/notification-responses', verifyJWT, async (req, res, next) => {
+  try {
+    const senderUsername = req.user?.preferred_username;
+    if (!senderUsername) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
+    }
+    const notifications = await getSentNotifications({ senderUsername });
+    return res.json({ status: 'SUCCESS', notifications });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /my-notifications — a data provider's own participation notifications.
+router.get('/my-notifications', verifyJWT, async (req, res, next) => {
+  try {
+    const username = req.user?.preferred_username;
+    if (!username) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
+    }
+    const notifications = await getRecipientNotifications({ username });
+    return res.json({ status: 'SUCCESS', notifications });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /notifications/:id/read — mark one of the caller's own notifications read.
+router.post('/notifications/:id/read', verifyJWT, async (req, res, next) => {
+  try {
+    const username = req.user?.preferred_username;
+    if (!username) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
+    }
+    const result = await markParticipationNotificationRead({ notificationId: req.params.id, username });
+    return res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /notifications/:id/respond — a data provider accepts/declines their
+// participation request. Accepting signs that provider's contract party.
+router.post('/notifications/:id/respond', verifyJWT, async (req, res, next) => {
+  try {
+    const username = req.user?.preferred_username;
+    if (!username) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
+    }
+    const { response, message } = req.body || {};
+    if (response !== 'accepted' && response !== 'declined') {
+      return res.status(400).json({ status: 'FAILED', error: 'INVALID_RESPONSE' });
+    }
+    const result = await respondToParticipationNotification({
+      notificationId: req.params.id, username, response, message: message || '',
+    });
+    console.log('[P3DX_STEP_OK] notifications/respond:', { username, response, id: req.params.id });
+    return res.json(result);
   } catch (err) {
     next(err);
   }

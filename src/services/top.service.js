@@ -271,6 +271,78 @@ export async function terminateTeeSession({ sessionId }) {
   return resp.data;
 }
 
+// Participation-consent notifications (gov_layer's fl_notifications.go),
+// mounted at the same /api/v1 base as buildTopUrl above. Unlike POST
+// /contract, these endpoints take no auth token — gov_layer doesn't gate
+// them — so no buildTopHeaders/jwt is needed here.
+
+// Creates one notification per recipient (POST /notifications). Used both for
+// the initial participation request and for re-sends that carry updated
+// selected/willing rosters.
+export async function sendParticipationNotifications({ recipients, senderUsername, message, payload }) {
+  const url = buildTopUrl('/notifications');
+  const resp = await axios.post(
+    url,
+    { recipients, senderUsername, message, payload },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// GET /notifications/{username} — notifications addressed to this recipient.
+export async function getRecipientNotifications({ username }) {
+  const url = buildTopUrl(`/notifications/${encodeURIComponent(username)}`);
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data?.notifications || [];
+}
+
+// GET /notifications/by-sender/{username} — notifications this output owner
+// has sent, each carrying the recipient's accepted/declined response so far.
+export async function getSentNotifications({ senderUsername }) {
+  const url = buildTopUrl(`/notifications/by-sender/${encodeURIComponent(senderUsername)}`);
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data?.notifications || [];
+}
+
+// PATCH /notifications/{id}/read — mark one notification read for its owner.
+export async function markParticipationNotificationRead({ notificationId, username }) {
+  const url = buildTopUrl(`/notifications/${encodeURIComponent(notificationId)}/read`);
+  const resp = await axios.patch(
+    url,
+    { username },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// POST /notifications/{id}/respond — a data provider accepts/declines their
+// participation request. This is also what signs that provider's party on
+// the session's contract (see p3dx_gov_layer db.SignDataProviderParty).
+export async function respondToParticipationNotification({ notificationId, username, response, message }) {
+  const url = buildTopUrl(`/notifications/${encodeURIComponent(notificationId)}/respond`);
+  const resp = await axios.post(
+    url,
+    { username, response, message },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
 export async function sendContractToTop({ contract, jwt }) {
   const enabledRaw = process.env.TOP_ENABLED;
   const enabled = typeof enabledRaw === 'string' ? enabledRaw.trim().toLowerCase() : 'false';

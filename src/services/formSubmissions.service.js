@@ -38,6 +38,14 @@ export async function listDatasetNames() {
   return Array.from(names).sort();
 }
 
+// All data-provider forms ever submitted, most-recently-submitted first
+// (APD's default order with no dataset_name filter). Used to look up each
+// registered data provider's latest declared RAM usage.
+export async function listProviderForms() {
+  const { data } = await apdGet('/api/v1/forms/provider-forms');
+  return Array.isArray(data) ? data : [];
+}
+
 export async function listSubmissions() {
   const { data } = await apdGet('/api/v1/forms/submissions');
   return Array.isArray(data) ? data : [];

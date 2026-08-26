@@ -100,6 +100,21 @@ export async function getUserId(username, adminToken) {
   return response.data[0].id;
 }
 
+/**
+ * List every user holding a given realm role (e.g. "data-provider") — the
+ * real provider directory, as opposed to any mock/static list.
+ */
+export async function getUsersByRole(roleName, adminToken) {
+  const { baseUrl, realm } = getKeycloakConfig();
+  const url = `${baseUrl}/admin/realms/${realm}/roles/${encodeURIComponent(roleName)}/users`;
+
+  const response = await axios.get(url, {
+    headers: { Authorization: `Bearer ${adminToken}` },
+  });
+
+  return response.data;
+}
+
 export async function assignRealmRole(userId, roleName, adminToken) {
   const { baseUrl, realm } = getKeycloakConfig();
 
