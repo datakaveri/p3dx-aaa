@@ -33,7 +33,10 @@ import {
   getSentNotifications,
   markParticipationNotificationRead,
   respondToParticipationNotification,
+  buildSessionContract,
+  getSessionContract,
 } from '../services/top.service.js';
+import { listProviderForms } from '../services/formSubmissions.service.js';
 import {
   KEY_PAIR_ROLES,
   provisionDataProviderKeyPair,
@@ -937,30 +940,37 @@ router.get('/keys/:roleName/private-key', verifyJWT, requireRole('user'), async 
 // from the request body, so a provider can't act as someone else.
 
 // POST /notify-providers — output owner sends (or re-sends) a participation
-// message to every selected data provider. The payload carries the full
-// selected roster plus whichever of them have already responded "willing"
-// (accepted so far), so providers always see live status alongside their
-// accept/decline prompt (see FederatedLearningDashboard.jsx's isRequest
+// message to every requested data provider (today: the whole directory,
+// broadcast regardless of the owner's manual pick). The payload separately
+// carries the owner's manually-checked roster (selected_providers, may be a
+// smaller subset or empty) plus whichever recipients have already responded
+// "willing" (accepted so far), so providers always see live status alongside
+// their accept/decline prompt (see FederatedLearningDashboard.jsx's isRequest
 // rendering). Accepting also signs that provider's party on the session's
 // contract (p3dx_gov_layer db.SignDataProviderParty).
 router.post('/notify-providers', verifyJWT, async (req, res, next) => {
   try {
     const { selected_providers, requested_providers, willing_providers, output_owner_id, submission_id } = req.body || {};
-    if (!Array.isArray(selected_providers) || selected_providers.length === 0) {
-      return res.status(400).json({ status: 'FAILED', error: 'MISSING_SELECTED_PROVIDERS' });
+    const requestedRoster = Array.isArray(requested_providers) && requested_providers.length
+      ? requested_providers
+      : selected_providers;
+    if (!Array.isArray(requestedRoster) || requestedRoster.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_REQUESTED_PROVIDERS' });
     }
 
     const senderUsername = req.user?.preferred_username || output_owner_id;
-    const recipients = selected_providers
+    const recipients = requestedRoster
       .filter(p => p && p.id && p.username)
       .map(p => ({ id: p.id, username: p.username }));
     if (recipients.length === 0) {
-      return res.status(400).json({ status: 'FAILED', error: 'SELECTED_PROVIDERS_MISSING_ID_OR_USERNAME' });
+      return res.status(400).json({ status: 'FAILED', error: 'REQUESTED_PROVIDERS_MISSING_ID_OR_USERNAME' });
     }
 
+    const selectedRoster = Array.isArray(selected_providers) ? selected_providers : [];
     const willingCount = Array.isArray(willing_providers) ? willing_providers.length : 0;
-    const message = `${senderUsername} selected ${selected_providers.length} data provider(s)` +
+    const message = `${senderUsername} requested ${requestedRoster.length} data provider(s)` +
       (submission_id ? ` for session ${submission_id}` : ' for a federated learning session') +
+      (selectedRoster.length ? ` — ${selectedRoster.length} selected by the owner` : '') +
       ` — ${willingCount} confirmed willing so far.`;
 
     const result = await sendParticipationNotifications({
@@ -971,8 +981,8 @@ router.post('/notify-providers', verifyJWT, async (req, res, next) => {
         kind: 'participation_request',
         submission_id,
         output_owner_id: output_owner_id || senderUsername,
-        selected_providers,
-        requested_providers: Array.isArray(requested_providers) && requested_providers.length ? requested_providers : selected_providers,
+        selected_providers: selectedRoster,
+        requested_providers: requestedRoster,
         willing_providers: Array.isArray(willing_providers) ? willing_providers : [],
       },
     });
@@ -981,6 +991,116 @@ router.post('/notify-providers', verifyJWT, async (req, res, next) => {
       sender: senderUsername, recipients: recipients.length, submission_id,
     });
     return res.status(201).json({ status: 'SUCCESS', created: result?.created ?? recipients.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /notify-roster — output owner sends the FINAL participant roster, once
+// every invited data provider has weighed in. Recipients are the providers who
+// actually confirmed willing (willing_providers) — this is a done-deal
+// announcement, not another accept/decline prompt. selected_providers is kept
+// for context (the owner's original pick) so the message/payload can show
+// "N of M selected are participating." This is also the point where the
+// session's FINAL contract gets built (finalize=true): each willing provider's
+// dataset_name/dataset_location_url is pulled from their most recent APD
+// provider-form (keyed by data_owner_id == username, same lookup GET
+// /api/v1/data-providers uses for RAM) so the contract's data-provider
+// entries carry real dataset info instead of being left blank.
+router.post('/notify-roster', verifyJWT, async (req, res, next) => {
+  try {
+    const { selected_providers, willing_providers, output_owner_id, submission_id } = req.body || {};
+    const willingRoster = Array.isArray(willing_providers) ? willing_providers : [];
+    if (willingRoster.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_WILLING_PROVIDERS' });
+    }
+
+    const senderUsername = req.user?.preferred_username || output_owner_id;
+    const recipients = willingRoster
+      .filter(p => p && p.id && p.username)
+      .map(p => ({ id: p.id, username: p.username }));
+    if (recipients.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'WILLING_PROVIDERS_MISSING_ID_OR_USERNAME' });
+    }
+
+    const selectedRoster = Array.isArray(selected_providers) ? selected_providers : [];
+    const names = recipients.map(p => p.username).join(', ');
+    const message = `${senderUsername} confirmed the final roster` +
+      (submission_id ? ` for session ${submission_id}` : ' for this federated learning session') +
+      ` — participating: ${names}.`;
+
+    const result = await sendParticipationNotifications({
+      recipients,
+      senderUsername,
+      message,
+      payload: {
+        kind: 'final_roster',
+        submission_id,
+        output_owner_id: output_owner_id || senderUsername,
+        selected_providers: selectedRoster,
+        willing_providers: willingRoster,
+      },
+    });
+
+    console.log('[P3DX_STEP_OK] notify-roster: sent', {
+      sender: senderUsername, recipients: recipients.length, submission_id,
+    });
+
+    let contractResult = null;
+    let contractError = null;
+    if (submission_id) {
+      try {
+        const providerForms = await listProviderForms();
+        const formByOwner = new Map();
+        for (const form of providerForms) {
+          const owner = form.data_owner_id;
+          if (owner && !formByOwner.has(owner)) formByOwner.set(owner, form);
+        }
+        const parties = recipients.map(p => {
+          const form = formByOwner.get(p.username);
+          return {
+            id: p.id,
+            username: p.username,
+            dataset_name: form?.dataset_name || '',
+            data_url: form?.dataset_location_url || '',
+          };
+        });
+        contractResult = await buildSessionContract({
+          submissionId: submission_id,
+          outputOwnerUserId: output_owner_id || senderUsername,
+          parties,
+          finalize: true,
+        });
+        console.log('[P3DX_STEP_OK] notify-roster: contract finalized', {
+          submission_id, contract_id: contractResult?.contract_id,
+        });
+      } catch (err) {
+        contractError = err.message || 'Failed to build session contract';
+        console.warn('[P3DX_STEP_WARN] notify-roster: contract build failed:', contractError);
+      }
+    }
+
+    return res.status(201).json({
+      status: 'SUCCESS',
+      created: result?.created ?? recipients.length,
+      contract_id: contractResult?.contract_id,
+      contract: contractResult?.contract,
+      contract_error: contractError,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /contract/:sessionId — read back the stored FL session contract (draft
+// before Final Roster, finalized after) so the owner can view/inspect it.
+router.get('/contract/:sessionId', verifyJWT, async (req, res, next) => {
+  try {
+    const contract = await getSessionContract({ sessionId: req.params.sessionId });
+    if (!contract) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND', message: 'No contract for this session' });
+    }
+    return res.json(contract);
   } catch (err) {
     next(err);
   }
@@ -1010,10 +1130,64 @@ router.get('/my-notifications', verifyJWT, async (req, res, next) => {
       return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
     }
     const notifications = await getRecipientNotifications({ username });
-    return res.json({ status: 'SUCCESS', notifications });
+    const unread_count = notifications.filter(n => !n.read).length;
+    return res.json({ status: 'SUCCESS', notifications, unread_count });
   } catch (err) {
     next(err);
   }
+});
+
+// GET /notifications/stream — Server-Sent Events push for a data provider's
+// notifications. EventSource can't set an Authorization header, so (like
+// gov_layer's own notification endpoints) this route takes no JWT, only the
+// username to watch; it never returns notification content itself, just a
+// nudge to refetch via the authenticated /my-notifications above. Bridges the
+// gap since gov_layer is REST-only: polls it on the sender's behalf and
+// forwards a push event the moment a new notification shows up.
+router.get('/notifications/stream', async (req, res) => {
+  const username = String(req.query.username || '').trim();
+  if (!username) {
+    return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write('\n');
+
+  // Seeded on the first poll so pre-existing notifications don't fire an
+  // event on connect — only ones created after this stream opened should.
+  let knownIds = null;
+
+  const poll = async () => {
+    try {
+      const notifications = await getRecipientNotifications({ username });
+      const currentIds = new Set(notifications.map(n => n.id));
+      if (knownIds === null) {
+        knownIds = currentIds;
+        return;
+      }
+      const hasNew = notifications.some(n => !knownIds.has(n.id));
+      knownIds = currentIds;
+      if (hasNew) {
+        res.write(`data: ${JSON.stringify({ type: 'notification' })}\n\n`);
+      }
+    } catch (err) {
+      console.warn('[SSE] notifications poll failed:', err.message);
+    }
+  };
+
+  poll();
+  const pollInterval = setInterval(poll, 4000);
+  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000);
+
+  req.on('close', () => {
+    clearInterval(pollInterval);
+    clearInterval(heartbeat);
+    res.end();
+  });
 });
 
 // POST /notifications/:id/read — mark one of the caller's own notifications read.

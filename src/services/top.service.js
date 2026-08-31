@@ -343,6 +343,44 @@ export async function respondToParticipationNotification({ notificationId, usern
   return resp.data;
 }
 
+// POST /contracts (gov_layer's fl_notifications-adjacent contracts.go) —
+// assembles and stores the FL session contract from a submission_id + parties
+// list. finalize=false on the initial participation request, finalize=true on
+// the Final Roster send (only the confirmed/willing parties at that point).
+// Each party may carry dataset_name/data_url pulled from that provider's APD
+// form so the contract's data-provider entries aren't left blank.
+export async function buildSessionContract({ submissionId, outputOwnerUserId, parties, finalize }) {
+  const url = buildTopUrl('/contracts');
+  const resp = await axios.post(
+    url,
+    {
+      submission_id: submissionId,
+      output_owner_user_id: outputOwnerUserId,
+      parties,
+      finalize: !!finalize,
+    },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// GET /contract/{sessionId} (contracts.go) — reads back the stored FL session
+// contract (draft or finalized) so the owner can view what was built.
+export async function getSessionContract({ sessionId }) {
+  const url = buildTopUrl(`/contract/${encodeURIComponent(sessionId)}`);
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
+  if (resp.status === 404) {
+    return null;
+  }
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
 export async function sendContractToTop({ contract, jwt }) {
   const enabledRaw = process.env.TOP_ENABLED;
   const enabled = typeof enabledRaw === 'string' ? enabledRaw.trim().toLowerCase() : 'false';
