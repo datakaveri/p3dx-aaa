@@ -2,7 +2,9 @@ import { v4 as uuidv4 } from 'uuid';
 import { getImmuDBClient, logAuditEvent } from './immudb.service.js';
 
 // data-provider is the single common role for data providers across FL, SMPC, and DP.
-const ALLOWED_ROLES = new Set(['application-provider', 'data-provider', 'output-owner']);
+// output-owner is not a requestable role — any non-data-provider user gets
+// the FL output-owner workflow automatically (see FederatedLearning.jsx).
+const ALLOWED_ROLES = new Set(['application-provider', 'data-provider']);
 
 function ensureAllowedRole(roleName) {
   if (!ALLOWED_ROLES.has(roleName)) {

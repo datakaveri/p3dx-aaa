@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { verifyJWT } from '../middlewares/auth.middleware.js';
+import { requireRole } from '../middlewares/role.middleware.js';
 import {
   createOutputOwnerSubmission,
   createDataProviderForm,
@@ -7,7 +8,9 @@ import {
   getSubmission,
   deleteSubmission,
   listDatasetNames,
+  listProviderForms,
 } from '../services/formSubmissions.service.js';
+import { getAdminToken, getUsersByRole } from '../services/keycloak.service.js';
 
 // Public-facing form endpoints, called directly by the frontend. Form
 // creation, storage, and CRUD (id minting, coercion logic) all live here now.
@@ -98,7 +101,42 @@ router.get('/available-datasets', verifyJWT, async (req, res, next) => {
   }
 });
 
-router.post('/data-provider-forms', verifyJWT, async (req, res, next) => {
+// The real data-provider directory: every Keycloak user holding the
+// data-provider role, enriched with their most-recently-submitted RAM usage
+// (from APD's provider forms, keyed by data_owner_id == username). Used by
+// the output-owner's provider-selection step in the FL flow.
+router.get('/api/v1/data-providers', verifyJWT, async (req, res, next) => {
+  try {
+    const [adminToken, providerForms] = await Promise.all([
+      getAdminToken(),
+      listProviderForms(),
+    ]);
+    const users = await getUsersByRole('data-provider', adminToken);
+
+    // listProviderForms() is most-recent-first, so the first form seen per
+    // owner is their latest submission.
+    const ramByOwner = new Map();
+    for (const form of providerForms) {
+      const owner = form.data_owner_id;
+      if (owner && !ramByOwner.has(owner)) {
+        ramByOwner.set(owner, form.ram_usage ?? null);
+      }
+    }
+
+    const dataProviders = users.map(u => ({
+      id: u.id,
+      username: u.username,
+      email: u.email,
+      ram_usage: ramByOwner.has(u.username) ? ramByOwner.get(u.username) : null,
+    }));
+
+    return res.json({ status: 'SUCCESS', data_providers: dataProviders });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/data-provider-forms', verifyJWT, requireRole('data-provider'), async (req, res, next) => {
   try {
     const payload = req.body?.payload;
     if (!payload) {

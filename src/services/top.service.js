@@ -143,7 +143,9 @@ export async function generateContractFromGovLayer({ token, datasetId, datasetNa
 // tee_contract.go's json tags field-for-field, which itself mirrors p3dx-apd's
 // domain.Contract. appDetails.imageId/imageHash are required by
 // ValidateTEEContract but aren't compared against anything on this demo path
-// (see that file's comments), so demo placeholders are fine here.
+// (see that file's comments), so demo placeholders are fine here. Both the
+// TEE and SMPC catalogue entry points call startTeeSession and get this same
+// skald-anonymizer image — there's no separate SMPC workload image yet.
 function buildTeeContract({ datasetUrl, datasetId, datasetName, consumerId }) {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + 30 * 60 * 1000); // 30-minute run window
@@ -266,6 +268,116 @@ export async function terminateTeeSession({ sessionId }) {
     throw err;
   }
 
+  return resp.data;
+}
+
+// Participation-consent notifications (gov_layer's fl_notifications.go),
+// mounted at the same /api/v1 base as buildTopUrl above. Unlike POST
+// /contract, these endpoints take no auth token — gov_layer doesn't gate
+// them — so no buildTopHeaders/jwt is needed here.
+
+// Creates one notification per recipient (POST /notifications). Used both for
+// the initial participation request and for re-sends that carry updated
+// selected/willing rosters.
+export async function sendParticipationNotifications({ recipients, senderUsername, message, payload }) {
+  const url = buildTopUrl('/notifications');
+  const resp = await axios.post(
+    url,
+    { recipients, senderUsername, message, payload },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// GET /notifications/{username} — notifications addressed to this recipient.
+export async function getRecipientNotifications({ username }) {
+  const url = buildTopUrl(`/notifications/${encodeURIComponent(username)}`);
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data?.notifications || [];
+}
+
+// GET /notifications/by-sender/{username} — notifications this output owner
+// has sent, each carrying the recipient's accepted/declined response so far.
+export async function getSentNotifications({ senderUsername }) {
+  const url = buildTopUrl(`/notifications/by-sender/${encodeURIComponent(senderUsername)}`);
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data?.notifications || [];
+}
+
+// PATCH /notifications/{id}/read — mark one notification read for its owner.
+export async function markParticipationNotificationRead({ notificationId, username }) {
+  const url = buildTopUrl(`/notifications/${encodeURIComponent(notificationId)}/read`);
+  const resp = await axios.patch(
+    url,
+    { username },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// POST /notifications/{id}/respond — a data provider accepts/declines their
+// participation request. This is also what signs that provider's party on
+// the session's contract (see p3dx_gov_layer db.SignDataProviderParty).
+export async function respondToParticipationNotification({ notificationId, username, response, message }) {
+  const url = buildTopUrl(`/notifications/${encodeURIComponent(notificationId)}/respond`);
+  const resp = await axios.post(
+    url,
+    { username, response, message },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// POST /contracts (gov_layer's fl_notifications-adjacent contracts.go) —
+// assembles and stores the FL session contract from a submission_id + parties
+// list. finalize=false on the initial participation request, finalize=true on
+// the Final Roster send (only the confirmed/willing parties at that point).
+// Each party may carry dataset_name/data_url pulled from that provider's APD
+// form so the contract's data-provider entries aren't left blank.
+export async function buildSessionContract({ submissionId, outputOwnerUserId, parties, finalize }) {
+  const url = buildTopUrl('/contracts');
+  const resp = await axios.post(
+    url,
+    {
+      submission_id: submissionId,
+      output_owner_user_id: outputOwnerUserId,
+      parties,
+      finalize: !!finalize,
+    },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// GET /contract/{sessionId} (contracts.go) — reads back the stored FL session
+// contract (draft or finalized) so the owner can view what was built.
+export async function getSessionContract({ sessionId }) {
+  const url = buildTopUrl(`/contract/${encodeURIComponent(sessionId)}`);
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
+  if (resp.status === 404) {
+    return null;
+  }
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
   return resp.data;
 }
 
