@@ -8,6 +8,8 @@ import {
   getSubmission,
   deleteSubmission,
   listDatasetNames,
+  listAvailableInfrastructure,
+  getInfrastructureDetails,
   listProviderForms,
 } from '../services/formSubmissions.service.js';
 import { getAdminToken, getUsersByRole } from '../services/keycloak.service.js';
@@ -95,6 +97,35 @@ router.get('/available-datasets', verifyJWT, async (req, res, next) => {
   try {
     const datasets = await listDatasetNames();
     return res.json({ status: 'SUCCESS', datasets });
+  } catch (err) {
+    if (sendStoreError(res, err)) return;
+    next(err);
+  }
+});
+
+// Infrastructure Catalogue (InfraCat) — backs the SMPC workload catalogue's
+// infrastructure picker in WorkloadForm.jsx. Open to any authenticated user,
+// same as /available-datasets — browsing the catalogue isn't role-gated.
+router.get('/available-infrastructure', verifyJWT, async (req, res, next) => {
+  try {
+    const infrastructure = await listAvailableInfrastructure();
+    return res.json({ status: 'SUCCESS', infrastructure });
+  } catch (err) {
+    if (sendStoreError(res, err)) return;
+    next(err);
+  }
+});
+
+// Full detail for one infra-provider policy — backs the "expand for details"
+// row in InfraCat. Same access as the list route above: any authenticated
+// user, not role-gated.
+router.get('/available-infrastructure/:itemId', verifyJWT, async (req, res, next) => {
+  try {
+    const infrastructure = await getInfrastructureDetails(req.params.itemId);
+    if (!infrastructure) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND' });
+    }
+    return res.json({ status: 'SUCCESS', infrastructure });
   } catch (err) {
     if (sendStoreError(res, err)) return;
     next(err);

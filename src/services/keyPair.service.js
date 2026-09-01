@@ -7,7 +7,7 @@ import { getAdminToken, setUserAttribute } from './keycloak.service.js';
 // already declared there.
 const PUBLIC_KEY_ATTRIBUTE = 'public-key';
 
-export const KEY_PAIR_ROLES = new Set(['data-provider']);
+export const KEY_PAIR_ROLES = new Set(['data-provider', 'infra-provider']);
 
 // One key pair per USER: Keycloak only has one "public-key" attribute slot,
 // so a returning data-provider always reuses their existing key pair rather
@@ -18,11 +18,11 @@ function keyStoreKey(userId) {
 }
 
 /**
- * Ensure a data-provider key pair exists for this user, right after the
- * data-provider role is granted. If the user already has a key pair, it's
- * reused as-is — the public key is already on their Keycloak profile.
- * Otherwise a fresh RSA pair is generated: the public half published to
- * Keycloak immediately, the private half held in immuDB (never logged,
+ * Ensure a key pair exists for this user, right after a KEY_PAIR_ROLES role
+ * (data-provider, infra-provider) is granted. If the user already has a key
+ * pair, it's reused as-is — the public key is already on their Keycloak
+ * profile. Otherwise a fresh RSA pair is generated: the public half published
+ * to Keycloak immediately, the private half held in immuDB (never logged,
  * never returned from a list endpoint, never rendered).
  */
 export async function provisionDataProviderKeyPair({ userId, roleName }) {

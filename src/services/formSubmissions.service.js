@@ -38,6 +38,24 @@ export async function listDatasetNames() {
   return Array.from(names).sort();
 }
 
+// Infrastructure Catalogue (InfraCat) — every registered infra-provider's
+// latest policy, for the SMPC workload catalogue's infrastructure picker.
+// Unlike datasets, infra data only ever lives in policies (no provider-form
+// analog), so no union is needed here.
+export async function listAvailableInfrastructure() {
+  const { data } = await apdGet('/api/v1/policy/infrastructure');
+  return Array.isArray(data) ? data : [];
+}
+
+// Full registered detail for one infra-provider policy (capacity/attestation/
+// platform) — powers the "expand for details" row in InfraCat. Unlike the
+// list endpoint, only returns the `infrastructure` block, not the whole
+// Policy (avoids leaking provider_id/provider_email to the browser).
+export async function getInfrastructureDetails(itemId) {
+  const { data } = await apdGet(`/api/v1/policy/by-item/${encodeURIComponent(itemId)}`);
+  return data?.rules?.infrastructure || null;
+}
+
 // All data-provider forms ever submitted, most-recently-submitted first
 // (APD's default order with no dataset_name filter). Used to look up each
 // registered data provider's latest declared RAM usage.

@@ -116,7 +116,7 @@ export async function sendWorkloadToTop({ token, datasetId, applicationId }) {
 // NOT gated behind TOP_ENABLED — it's the core generation path, not optional
 // forwarding. Returns the unsigned contract for display; nothing is
 // signed/stored/deployed by this call.
-export async function generateContractFromGovLayer({ token, datasetId, datasetName, applicationId, technique }) {
+export async function generateContractFromGovLayer({ token, datasetId, datasetName, applicationId, technique, infraId }) {
   const url = buildTopUrl('/generate-contract');
   const headers = buildTopHeaders({ jwt: token });
 
@@ -127,6 +127,9 @@ export async function generateContractFromGovLayer({ token, datasetId, datasetNa
       dataset_name: datasetName,
       application_id: applicationId,
       technique,
+      // InfraCat selection — SMPC only, omitted entirely when absent so
+      // TEE/FL callers and older clients keep sending exactly what they did before.
+      ...(infraId ? { infra_id: infraId } : {}),
     },
     { headers, timeout: 10000, validateStatus: () => true }
   );
