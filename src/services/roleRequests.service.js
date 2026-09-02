@@ -2,9 +2,12 @@ import { v4 as uuidv4 } from 'uuid';
 import { getImmuDBClient, logAuditEvent } from './immudb.service.js';
 
 // data-provider is the single common role for data providers across FL, SMPC, and DP.
+// infra-provider is SMPC-only — it lets a user register an Infrastructure Policy
+// (see p3dx.routes.js POST /policy and InfraPolicyForm.jsx), it is not usable for
+// Spider/FL/TEE dataset access policies.
 // output-owner is not a requestable role — any non-data-provider user gets
 // the FL output-owner workflow automatically (see FederatedLearning.jsx).
-const ALLOWED_ROLES = new Set(['application-provider', 'data-provider']);
+const ALLOWED_ROLES = new Set(['application-provider', 'data-provider', 'infra-provider']);
 
 function ensureAllowedRole(roleName) {
   if (!ALLOWED_ROLES.has(roleName)) {
