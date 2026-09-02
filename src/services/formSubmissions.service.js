@@ -26,16 +26,30 @@ export async function createDataProviderForm(payload = {}) {
 // Datasets are "available" from two sources: data-provider forms
 // (dataset_name typed on the FL form) and policies (Set Policy page). Union
 // the two so either path makes a dataset show up as available.
+//
+// The two sources disagree on identity: provider forms have no id at all
+// (provider_forms carries only dataset_name), while policies are keyed by a
+// real item_id that a later by-item policy lookup (Generate Contract) needs
+// verbatim — sending the display name there misses, since the policies
+// table's item_id column holds the Dataset ID the provider typed on Set
+// Policy, not the Dataset name. So each entry here carries {id, name}: for
+// policy-backed datasets `id` is the real item_id; for provider-form-only
+// datasets (no policy set yet) `id` falls back to the name itself, since
+// that's the only handle FetchDatasetForm's own by-name lookup uses anyway.
+// When the same name exists in both sources, the policy's real item_id wins.
 export async function listDatasetNames() {
   const [providerForms, policies] = await Promise.all([
-    apdGet('/api/v1/forms/dataset-names'),
-    apdGet('/api/v1/policy/datasets'),
+    apdGet('/api/v1/forms/dataset-names'), // string[] of names, no id
+    apdGet('/api/v1/policy/datasets'),     // [{item_id, name}]
   ]);
-  const names = new Set([
-    ...(Array.isArray(providerForms.data) ? providerForms.data : []),
-    ...(Array.isArray(policies.data) ? policies.data : []),
-  ]);
-  return Array.from(names).sort();
+  const byName = new Map();
+  for (const name of (Array.isArray(providerForms.data) ? providerForms.data : [])) {
+    if (name) byName.set(name, { id: name, name });
+  }
+  for (const d of (Array.isArray(policies.data) ? policies.data : [])) {
+    if (d?.name) byName.set(d.name, { id: d.item_id, name: d.name });
+  }
+  return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
 }
 
 // All data-provider forms ever submitted, most-recently-submitted first
