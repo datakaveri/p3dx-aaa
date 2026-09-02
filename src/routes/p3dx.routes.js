@@ -400,6 +400,11 @@ router.post('/workloads/preview-contract', verifyJWT, requireRole('user'), async
     }
 
     const datasetId = req.body?.datasetId || req.body?.dataset;
+    // datasetId is the real item_id (dataset picker now sends {id, name}
+    // pairs — see formSubmissions.service.js's listDatasetNames). Fall back
+    // to datasetId only for older/other callers that never sent a separate
+    // name, so the gov_layer call still gets *something* human-readable.
+    const datasetName = req.body?.datasetName || datasetId;
     const technique = req.body?.technique;
     const applicationId = req.body?.applicationId || req.body?.application || 'unselected-application';
     const infraId = req.body?.infraId || req.body?.infra_id;
@@ -414,7 +419,7 @@ router.post('/workloads/preview-contract', verifyJWT, requireRole('user'), async
     const contract = await generateContractFromGovLayer({
       token: keycloakToken,
       datasetId,
-      datasetName: datasetId,
+      datasetName,
       applicationId,
       technique,
       infraId,
