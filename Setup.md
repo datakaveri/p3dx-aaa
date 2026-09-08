@@ -114,7 +114,7 @@ Inside `psql`:
 
 ```sql
 CREATE DATABASE keycloak;
-CREATE USER keycloak_admin WITH PASSWORD '<KEYCLOAK_DB_PASSWORD>';
+CREATE USER keycloak_admin WITH PASSWORD '<Admin@123>';
 ALTER DATABASE keycloak OWNER TO keycloak_admin;
 GRANT ALL PRIVILEGES ON DATABASE keycloak TO keycloak_admin;
 ```

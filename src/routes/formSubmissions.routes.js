@@ -15,9 +15,9 @@ import {
 import { getAdminToken, getUsersByRole } from '../services/keycloak.service.js';
 
 // Public-facing form endpoints, called directly by the frontend. Form
-// creation, storage, and CRUD (id minting, coercion logic) all live here now.
-// Each write also pushes the document to the governance layer (see
-// govLayerPush.service.js) so FL orchestration/reports have a copy.
+// creation, storage, and CRUD (id minting, coercion logic) all live here now,
+// forwarded straight to APD (the store of record) — see
+// formSubmissions.service.js.
 const router = Router();
 
 function sendStoreError(res, err) {

@@ -38,6 +38,12 @@ import {
 } from '../services/top.service.js';
 import { listProviderForms } from '../services/formSubmissions.service.js';
 import {
+  createProvisioningToken,
+  appendProvisioningEvent,
+  getProvisioningStatusForUser,
+} from '../services/vmProvisioning.service.js';
+import { runAutoProvision, takePrivateKey, isProvisioning } from '../services/vmAutoProvision.service.js';
+import {
   KEY_PAIR_ROLES,
   provisionDataProviderKeyPair,
   getPrivateKeyRecord,
@@ -1109,6 +1115,82 @@ router.post('/notify-roster', verifyJWT, async (req, res, next) => {
   }
 });
 
+// POST /gov/start-fl-session — output owner kicks off the FL session for a
+// submission. Minimal implementation: notifies each provider on the finalized
+// roster (payload.kind: 'fl_session_start') so their dashboard can prompt them
+// to sign in with their own Azure account. Does NOT provision environments,
+// push client config, or start FL server/client processes - that orchestration
+// pipeline was removed from gov_layer (SCL-103) and is out of scope here.
+router.post('/gov/start-fl-session', verifyJWT, async (req, res, next) => {
+  try {
+    const { submission_id, participating_providers } = req.body || {};
+    if (!submission_id) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_SUBMISSION_ID' });
+    }
+    const providers = Array.isArray(participating_providers) ? participating_providers : [];
+    const recipients = providers
+      .filter(p => p && p.id && p.username)
+      .map(p => ({ id: p.id, username: p.username }));
+    if (recipients.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_PARTICIPATING_PROVIDERS' });
+    }
+
+    const senderUsername = req.user?.preferred_username;
+    const result = await sendParticipationNotifications({
+      recipients,
+      senderUsername,
+      message: `${senderUsername} started the FL session for submission ${submission_id} — sign in with your Azure account to join.`,
+      payload: {
+        kind: 'fl_session_start',
+        submission_id,
+        output_owner_id: senderUsername,
+      },
+    });
+
+    console.log('[P3DX_STEP_OK] start-fl-session: notified', {
+      sender: senderUsername, recipients: recipients.length, submission_id,
+    });
+
+    return res.status(200).json({
+      status: 'SUCCESS',
+      notified: result?.created ?? recipients.length,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /gov/azure-signin — a data provider tells the output owner their Azure
+// sign-in for this FL session is done, so the owner's dashboard can show it
+// live (reuses the same participation-notification channel as everything
+// else in this file — just a one-way, no-response notice).
+router.post('/gov/azure-signin', verifyJWT, async (req, res, next) => {
+  try {
+    const { owner_username, submission_id } = req.body || {};
+    if (!owner_username) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_OWNER_USERNAME' });
+    }
+    const providerUsername = req.user?.preferred_username;
+    const adminToken = await getAdminToken();
+    const ownerId = await getUserId(owner_username, adminToken);
+
+    const result = await sendParticipationNotifications({
+      recipients: [{ id: ownerId, username: owner_username }],
+      senderUsername: providerUsername,
+      message: `${providerUsername} signed in with Azure${submission_id ? ` for submission ${submission_id}` : ''}.`,
+      payload: { kind: 'azure_signin', submission_id, provider_username: providerUsername },
+    });
+
+    console.log('[P3DX_STEP_OK] azure-signin: notified owner', {
+      provider: providerUsername, owner: owner_username, submission_id,
+    });
+
+    return res.status(200).json({ status: 'SUCCESS', notified: result?.created ?? 1 });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /contract/:sessionId — read back the stored FL session contract (draft
 // before Final Roster, finalized after) so the owner can view/inspect it.
 router.get('/contract/:sessionId', verifyJWT, async (req, res, next) => {
@@ -1198,6 +1280,125 @@ router.get('/notifications/stream', async (req, res) => {
 
   poll();
   const pollInterval = setInterval(poll, 4000);
+  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000);
+
+  req.on('close', () => {
+    clearInterval(pollInterval);
+    clearInterval(heartbeat);
+    res.end();
+  });
+});
+
+// POST /vm-provisioning/auto-create — fully automated VM creation: kicks off
+// `az login --use-device-code` (isolated per participant) followed by
+// Terraform, driven by that participant's own freshly-authenticated Azure
+// CLI session. Responds immediately with a token identifying this run;
+// progress (including the device code to enter) streams over
+// /vm-provisioning/stream below. See vmAutoProvision.service.js for why this
+// can't just reuse the browser's MSAL token.
+router.post('/vm-provisioning/auto-create', verifyJWT, async (req, res) => {
+  const username = req.user?.preferred_username;
+  if (!username) {
+    return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
+  }
+  const role = req.body?.role === 'data-provider' ? 'data-provider' : 'user';
+  const vmName = typeof req.body?.vmName === 'string' ? req.body.vmName.trim() : '';
+  if (!vmName) {
+    return res.status(400).json({ status: 'FAILED', error: 'MISSING_VM_NAME' });
+  }
+
+  // A run for this user is already in flight (e.g. a duplicate mount, or a
+  // retry click before the first one finished) - don't spawn a second
+  // `az login`/terraform run; the existing one is still streaming to the
+  // same SSE subscription (keyed by username), so there's nothing more to do.
+  if (isProvisioning(username)) {
+    return res.status(202).json({ status: 'SUCCESS', already_running: true });
+  }
+
+  const token = createProvisioningToken({ username, role });
+  res.status(202).json({ status: 'SUCCESS', token });
+  runAutoProvision({ token, username, role, vmName }).catch((err) => {
+    console.error('[vm-auto-provision] unhandled failure:', err);
+  });
+});
+
+// GET /vm-provisioning/private-key — one-time download of the SSH private
+// key generated for the caller's most recently auto-created VM. JWT-authed
+// (unlike the token-authed routes below) since this is called straight from
+// the browser, not by a headless script.
+router.get('/vm-provisioning/private-key', verifyJWT, (req, res) => {
+  const username = req.user?.preferred_username;
+  const key = username && takePrivateKey(username);
+  if (!key) {
+    return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND_OR_ALREADY_DOWNLOADED' });
+  }
+  res.setHeader('Content-Type', 'application/x-pem-file');
+  res.setHeader('Content-Disposition', 'attachment; filename="p3dx_flo_vm_key.pem"');
+  res.send(key);
+});
+
+// POST /vm-provisioning/token — mint a short-lived token identifying the
+// caller, so their local `terraform/participant-vm/deploy.sh` run can report
+// progress back to their own FL dashboard. deploy.sh runs on the
+// participant's own machine against their own Azure subscription — this
+// backend never sees or needs their Azure credentials, only these status
+// pings. See vmProvisioning.service.js.
+router.post('/vm-provisioning/token', verifyJWT, async (req, res) => {
+  const username = req.user?.preferred_username;
+  if (!username) {
+    return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
+  }
+  const role = req.body?.role === 'data-provider' ? 'data-provider' : 'user';
+  const token = createProvisioningToken({ username, role });
+  return res.status(201).json({ status: 'SUCCESS', token });
+});
+
+// POST /vm-provisioning/events — deploy.sh posts one event per step here.
+// Token-authenticated rather than JWT-authenticated: the caller is a local
+// shell script with no browser session, just the token minted above.
+router.post('/vm-provisioning/events', async (req, res) => {
+  const { token, step, command, status, message } = req.body || {};
+  if (!token || !step || !status) {
+    return res.status(400).json({ status: 'FAILED', error: 'MISSING_FIELDS' });
+  }
+  const session = appendProvisioningEvent({ token, step, command, status, message });
+  if (!session) {
+    return res.status(404).json({ status: 'FAILED', error: 'UNKNOWN_OR_EXPIRED_TOKEN' });
+  }
+  return res.status(200).json({ status: 'SUCCESS' });
+});
+
+// GET /vm-provisioning/stream — SSE push of the caller's VM provisioning
+// events, same poll-and-forward pattern as /notifications/stream above
+// (EventSource can't set an Authorization header, so this takes username as
+// a query param rather than a JWT). Sends the full event log each time it
+// changes — traffic is tiny and short-lived, so no need to diff.
+router.get('/vm-provisioning/stream', async (req, res) => {
+  const username = String(req.query.username || '').trim();
+  if (!username) {
+    return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
+  }
+  const role = req.query.role === 'data-provider' ? 'data-provider' : 'user';
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write('\n');
+
+  let lastCount = -1;
+  const poll = () => {
+    const session = getProvisioningStatusForUser(username, role);
+    const events = session?.events || [];
+    if (events.length !== lastCount) {
+      res.write(`data: ${JSON.stringify({ status: session?.status || 'idle', events })}\n\n`);
+      lastCount = events.length;
+    }
+  };
+
+  poll();
+  const pollInterval = setInterval(poll, 2000);
   const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000);
 
   req.on('close', () => {

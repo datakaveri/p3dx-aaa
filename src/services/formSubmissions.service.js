@@ -1,17 +1,15 @@
 import { apdGet, apdPost, apdDelete } from './apdFormsClient.service.js';
-import { pushSubmission, pushSubmissionDeleted, pushProviderForm } from './govLayerPush.service.js';
 
 // APD is the store of record for FL forms (output-owner submissions and
 // data-provider forms) — every write here is forwarded to APD's
 // /api/v1/forms/* endpoints, which own id minting, numeric/string coercion,
 // and the upsert-by-form_id behavior this file used to implement directly
-// against immudb. Each write also pushes the resulting document to the
-// governance layer (best-effort) so FL orchestration/reports have a local
-// copy without pulling from aaa.
+// against immudb. gov_layer reads forms straight from APD on demand
+// (FetchDatasetForm, GET /api/v1/forms/provider-forms) rather than keeping
+// its own copy, so no second write is needed here.
 
 export async function createOutputOwnerSubmission(payload = {}) {
   const { data: doc } = await apdPost('/api/v1/forms/submissions', payload);
-  await pushSubmission(doc);
   return doc.id;
 }
 
@@ -19,7 +17,6 @@ export async function createOutputOwnerSubmission(payload = {}) {
 // quirk predates the move to APD and is kept as-is.
 export async function createDataProviderForm(payload = {}) {
   const { data: doc } = await apdPost('/api/v1/forms/provider-forms', payload);
-  await pushProviderForm(doc);
   return doc.id;
 }
 
@@ -91,6 +88,5 @@ export async function getSubmission(id) {
 export async function deleteSubmission(id) {
   const { status } = await apdDelete(`/api/v1/forms/submissions/${encodeURIComponent(id)}`);
   if (status === 404) return false;
-  await pushSubmissionDeleted(id);
   return true;
 }
