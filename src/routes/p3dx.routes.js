@@ -1,4 +1,13 @@
 import { Router } from 'express';
+
+// Mirrors InfraPolicyForm.jsx's slugify() exactly — used to derive an
+// infra-provider's provider_id server-side from their verified JWT, so it
+// can't be spoofed via the request body. Keep in sync if the frontend's
+// version ever changes.
+function slugify(s) {
+  return String(s || 'unknown').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+}
+
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -728,12 +737,26 @@ router.post('/policy', verifyJWT, requireRole('user'), async (req, res, next) =>
     // InfraPolicyForm.jsx) require the infra-provider role and nothing else —
     // this is the actual enforcement of "infra-provider may only set policy
     // for SMPC infrastructure, never a Spider/FL/TEE dataset-access policy".
-    // Every other policy shape keeps the original data-provider-only gate.
+    // Dataset policies (rules.policy_type === 'data-provider', set by
+    // PolicyForm.jsx) get the same server-side provider_id derivation, for
+    // the same reason — it's what makes "My Datasets" ownership-scoped
+    // list/edit/delete trustworthy instead of client-spoofable. Any other
+    // (untagged) policy shape keeps the original data-provider-only gate,
+    // with no provider_id override, for backward compatibility.
     const policyType = req.body?.rules?.policy_type;
-    if (policyType === 'infra-provider') {
-      if (!roles.includes('infra-provider')) {
+    if (policyType === 'infra-provider' || policyType === 'data-provider') {
+      const requiredRole = policyType === 'infra-provider' ? 'infra-provider' : 'data-provider';
+      if (!roles.includes(requiredRole)) {
         return res.status(403).json({ status: 'FAILED', error: 'INSUFFICIENT_ROLE' });
       }
+      // Never trust the client-supplied provider_id — derive it server-side
+      // from the caller's verified JWT instead. This is what makes APD's
+      // write-path ownership check (item_id vs. existing provider_id) a real
+      // guarantee rather than a comparison of two client-supplied strings.
+      req.body = {
+        ...req.body,
+        provider_id: `provider-${slugify(req.user?.preferred_username || req.user?.email)}`,
+      };
     } else if (!roles.includes('data-provider')) {
       return res.status(403).json({ status: 'FAILED', error: 'INSUFFICIENT_ROLE' });
     }
@@ -778,6 +801,223 @@ router.post('/policy', verifyJWT, requireRole('user'), async (req, res, next) =>
     });
 
     return res.status(201).json({ status: 'SUCCESS', apd: data });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /policy/mine — "My Infrastructure" dashboard list for the logged-in
+// infra-provider. provider_id is derived from the JWT the same way POST
+// /policy now does, then forwarded to APD as a query param.
+router.get('/policy/mine', verifyJWT, requireRole('infra-provider'), async (req, res, next) => {
+  try {
+    const providerId = `provider-${slugify(req.user?.preferred_username || req.user?.email)}`;
+
+    const apdBaseUrlRaw = process.env.APD_BASE_URL;
+    const apdBaseUrl = typeof apdBaseUrlRaw === 'string' ? apdBaseUrlRaw.trim() : '';
+    if (!apdBaseUrl) {
+      return res.status(503).json({ status: 'FAILED', error: 'APD_NOT_CONFIGURED' });
+    }
+
+    const base = apdBaseUrl.endsWith('/') ? apdBaseUrl.slice(0, -1) : apdBaseUrl;
+    const url = `${base}/api/v1/policy/mine?provider_id=${encodeURIComponent(providerId)}`;
+
+    const upstream = await fetch(url);
+    const text = await upstream.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({
+        status: 'FAILED',
+        error: data?.message || data?.error || 'APD_POLICY_LIST_FAILED',
+      });
+    }
+
+    return res.json({ status: 'SUCCESS', data: data?.data || [] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /policy/by-item/:itemId — soft-deletes one of the logged-in
+// infra-provider's own infrastructure entries. provider_id is derived from
+// the JWT (never trusted from the client), so APD's ownership-scoped delete
+// query can only ever match the caller's own entries.
+router.delete('/policy/by-item/:itemId', verifyJWT, requireRole('infra-provider'), async (req, res, next) => {
+  try {
+    const providerId = `provider-${slugify(req.user?.preferred_username || req.user?.email)}`;
+
+    const apdBaseUrlRaw = process.env.APD_BASE_URL;
+    const apdBaseUrl = typeof apdBaseUrlRaw === 'string' ? apdBaseUrlRaw.trim() : '';
+    if (!apdBaseUrl) {
+      return res.status(503).json({ status: 'FAILED', error: 'APD_NOT_CONFIGURED' });
+    }
+
+    const base = apdBaseUrl.endsWith('/') ? apdBaseUrl.slice(0, -1) : apdBaseUrl;
+    const url = `${base}/api/v1/policy/by-item/${encodeURIComponent(req.params.itemId)}?provider_id=${encodeURIComponent(providerId)}`;
+
+    const upstream = await fetch(url, { method: 'DELETE' });
+    const text = await upstream.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+
+    if (upstream.status === 404) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND' });
+    }
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({
+        status: 'FAILED',
+        error: data?.message || data?.error || 'APD_POLICY_DELETE_FAILED',
+      });
+    }
+
+    return res.json({ status: 'SUCCESS' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /policy/mine-datasets — "My Datasets" dashboard list for the logged-in
+// data-provider. Mirrors GET /policy/mine exactly.
+router.get('/policy/mine-datasets', verifyJWT, requireRole('data-provider'), async (req, res, next) => {
+  try {
+    const providerId = `provider-${slugify(req.user?.preferred_username || req.user?.email)}`;
+
+    const apdBaseUrlRaw = process.env.APD_BASE_URL;
+    const apdBaseUrl = typeof apdBaseUrlRaw === 'string' ? apdBaseUrlRaw.trim() : '';
+    if (!apdBaseUrl) {
+      return res.status(503).json({ status: 'FAILED', error: 'APD_NOT_CONFIGURED' });
+    }
+
+    const base = apdBaseUrl.endsWith('/') ? apdBaseUrl.slice(0, -1) : apdBaseUrl;
+    const url = `${base}/api/v1/policy/mine-datasets?provider_id=${encodeURIComponent(providerId)}`;
+
+    const upstream = await fetch(url);
+    const text = await upstream.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({
+        status: 'FAILED',
+        error: data?.message || data?.error || 'APD_POLICY_LIST_FAILED',
+      });
+    }
+
+    return res.json({ status: 'SUCCESS', data: data?.data || [] });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /policy/mine-datasets/:itemId — full detail for one of the logged-in
+// data-provider's own dataset entries, for PolicyForm.jsx's Edit flow. Calls
+// APD's generic (unfiltered) by-item lookup directly — not the public
+// InfraCat-style stripped endpoint — then enforces ownership here before
+// returning anything, and strips provider_id/provider_email/issuedBy/
+// policyId from the response (those stay derived from the logged-in user on
+// the frontend, never round-tripped from fetched data).
+router.get('/policy/mine-datasets/:itemId', verifyJWT, requireRole('data-provider'), async (req, res, next) => {
+  try {
+    const providerId = `provider-${slugify(req.user?.preferred_username || req.user?.email)}`;
+
+    const apdBaseUrlRaw = process.env.APD_BASE_URL;
+    const apdBaseUrl = typeof apdBaseUrlRaw === 'string' ? apdBaseUrlRaw.trim() : '';
+    if (!apdBaseUrl) {
+      return res.status(503).json({ status: 'FAILED', error: 'APD_NOT_CONFIGURED' });
+    }
+
+    const base = apdBaseUrl.endsWith('/') ? apdBaseUrl.slice(0, -1) : apdBaseUrl;
+    const url = `${base}/api/v1/policy/by-item/${encodeURIComponent(req.params.itemId)}`;
+
+    const upstream = await fetch(url);
+    const text = await upstream.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+
+    if (upstream.status === 404) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND' });
+    }
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({
+        status: 'FAILED',
+        error: data?.message || data?.error || 'APD_POLICY_FETCH_FAILED',
+      });
+    }
+
+    const policy = data?.data;
+    if (!policy || policy.provider_id !== providerId) {
+      return res.status(policy ? 403 : 404).json({ status: 'FAILED', error: policy ? 'FORBIDDEN' : 'NOT_FOUND' });
+    }
+
+    return res.json({
+      status: 'SUCCESS',
+      data: {
+        item_id: policy.itemId,
+        rules: policy.rules,
+        is_private: policy.is_private,
+        data_url: policy.data_url,
+        expiresAt: policy.expiresAt,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /policy/by-item-dataset/:itemId — soft-deletes one of the logged-in
+// data-provider's own dataset entries. Mirrors DELETE /policy/by-item/:itemId
+// exactly.
+router.delete('/policy/by-item-dataset/:itemId', verifyJWT, requireRole('data-provider'), async (req, res, next) => {
+  try {
+    const providerId = `provider-${slugify(req.user?.preferred_username || req.user?.email)}`;
+
+    const apdBaseUrlRaw = process.env.APD_BASE_URL;
+    const apdBaseUrl = typeof apdBaseUrlRaw === 'string' ? apdBaseUrlRaw.trim() : '';
+    if (!apdBaseUrl) {
+      return res.status(503).json({ status: 'FAILED', error: 'APD_NOT_CONFIGURED' });
+    }
+
+    const base = apdBaseUrl.endsWith('/') ? apdBaseUrl.slice(0, -1) : apdBaseUrl;
+    const url = `${base}/api/v1/policy/by-item-dataset/${encodeURIComponent(req.params.itemId)}?provider_id=${encodeURIComponent(providerId)}`;
+
+    const upstream = await fetch(url, { method: 'DELETE' });
+    const text = await upstream.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = null;
+    }
+
+    if (upstream.status === 404) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND' });
+    }
+    if (!upstream.ok) {
+      return res.status(upstream.status).json({
+        status: 'FAILED',
+        error: data?.message || data?.error || 'APD_POLICY_DELETE_FAILED',
+      });
+    }
+
+    return res.json({ status: 'SUCCESS' });
   } catch (err) {
     next(err);
   }
