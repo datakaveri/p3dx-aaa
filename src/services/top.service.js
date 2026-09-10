@@ -116,20 +116,21 @@ export async function sendWorkloadToTop({ token, datasetId, applicationId }) {
 // NOT gated behind TOP_ENABLED — it's the core generation path, not optional
 // forwarding. Returns the unsigned contract for display; nothing is
 // signed/stored/deployed by this call.
-export async function generateContractFromGovLayer({ token, datasetId, datasetName, applicationId, technique, infraId }) {
+export async function generateContractFromGovLayer({ token, datasets, applicationId, technique, infraIds }) {
   const url = buildTopUrl('/generate-contract');
   const headers = buildTopHeaders({ jwt: token });
 
   const resp = await axios.post(
     url,
     {
-      dataset_id: datasetId,
-      dataset_name: datasetName,
+      // datasets is one or more {datasetId, datasetName} pairs — mapped to
+      // gov_layer's dataset_id/dataset_name wire shape per item.
+      datasets: datasets.map(d => ({ dataset_id: d.datasetId, dataset_name: d.datasetName })),
       application_id: applicationId,
       technique,
       // InfraCat selection — SMPC only, omitted entirely when absent so
       // TEE/FL callers and older clients keep sending exactly what they did before.
-      ...(infraId ? { infra_id: infraId } : {}),
+      ...(infraIds?.length ? { infra_ids: infraIds } : {}),
     },
     { headers, timeout: 10000, validateStatus: () => true }
   );
