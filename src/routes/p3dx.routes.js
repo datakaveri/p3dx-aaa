@@ -295,7 +295,7 @@ router.post('/refresh-token', async (req, res, next) => {
   }
 });
 
-router.get('/me', verifyJWT, requireAnyRole(['user', 'admin']), async (req, res) => {
+router.get('/me', verifyJWT, requireAnyRole(['user', 'admin', 'fl-orchestrator']), async (req, res) => {
   await logAuditEvent('USER_PROFILE_ACCESS', req.user.preferred_username, {
     ip: req.ip,
     userAgent: req.get('user-agent'),
@@ -1115,15 +1115,64 @@ router.post('/notify-roster', verifyJWT, async (req, res, next) => {
   }
 });
 
-// POST /gov/start-fl-session — output owner kicks off the FL session for a
-// submission. Minimal implementation: notifies each provider on the finalized
-// roster (payload.kind: 'fl_session_start') so their dashboard can prompt them
-// to sign in with their own Azure account. Does NOT provision environments,
-// push client config, or start FL server/client processes - that orchestration
-// pipeline was removed from gov_layer (SCL-103) and is out of scope here.
+// POST /gov/queue-fl-session — output owner clicks "Start FL Session". Rather
+// than doing the Azure sign-in themselves, this just queues the request for
+// the fl-orchestrator operator account (payload.kind: 'fl_session_pending')
+// - see p3dx-auth-ui's pages/fl_orchestrator/FL_Orchestrator.jsx, which lists these and does the actual
+// start-fl-session + Azure sign-in below on the owner's behalf.
+router.post('/gov/queue-fl-session', verifyJWT, async (req, res, next) => {
+  try {
+    const { submission_id, participating_providers, vm_name } = req.body || {};
+    if (!submission_id) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_SUBMISSION_ID' });
+    }
+    const providers = Array.isArray(participating_providers) ? participating_providers : [];
+    if (providers.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_PARTICIPATING_PROVIDERS' });
+    }
+
+    const outputOwnerUsername = req.user?.preferred_username;
+    const adminToken = await getAdminToken();
+    const orchestratorId = await getUserId('fl-orchestrator', adminToken);
+
+    await sendParticipationNotifications({
+      recipients: [{ id: orchestratorId, username: 'fl-orchestrator' }],
+      senderUsername: outputOwnerUsername,
+      message: `${outputOwnerUsername} requested to start the FL session for submission ${submission_id}.`,
+      payload: {
+        kind: 'fl_session_pending',
+        submission_id,
+        participating_providers: providers,
+        vm_name: vm_name || '',
+        output_owner_username: outputOwnerUsername,
+      },
+    });
+
+    console.log('[P3DX_STEP_OK] queue-fl-session: queued for fl-orchestrator', {
+      owner: outputOwnerUsername, submission_id,
+    });
+
+    return res.status(200).json({ status: 'SUCCESS' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /gov/start-fl-session — actually kicks off the FL session for a
+// submission: notifies each provider on the finalized roster (payload.kind:
+// 'fl_session_start') so their dashboard can prompt them to sign in with
+// their own Azure account. Called by the fl-orchestrator operator (from the
+// queue above) rather than the owner directly, so output_owner_username is
+// accepted separately from the caller's own identity - otherwise providers
+// would see the notification as coming from "fl-orchestrator" instead of the
+// real owner. Falls back to the caller's own username when absent, so any
+// direct caller keeps working as before. Does NOT provision environments,
+// push client config, or start FL server/client processes - that
+// orchestration pipeline was removed from gov_layer (SCL-103) and is out of
+// scope here.
 router.post('/gov/start-fl-session', verifyJWT, async (req, res, next) => {
   try {
-    const { submission_id, participating_providers } = req.body || {};
+    const { submission_id, participating_providers, output_owner_username } = req.body || {};
     if (!submission_id) {
       return res.status(400).json({ status: 'FAILED', error: 'MISSING_SUBMISSION_ID' });
     }
@@ -1135,7 +1184,7 @@ router.post('/gov/start-fl-session', verifyJWT, async (req, res, next) => {
       return res.status(400).json({ status: 'FAILED', error: 'MISSING_PARTICIPATING_PROVIDERS' });
     }
 
-    const senderUsername = req.user?.preferred_username;
+    const senderUsername = output_owner_username || req.user?.preferred_username;
     const result = await sendParticipationNotifications({
       recipients,
       senderUsername,

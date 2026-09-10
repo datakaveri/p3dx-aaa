@@ -211,7 +211,20 @@ export async function runAutoProvision({ token, username, role, vmName }) {
     event({ step: 'Provisioning failed', status: 'error', message: err?.message || String(err) });
   } finally {
     activeUsernames.delete(username);
-    if (workDir) await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    if (workDir) {
+      // On a failed run the VM may already exist (terraform apply can fail
+      // partway through, e.g. wait_for_combine_fl timing out) with this run's
+      // public key installed as its only admin_ssh_key — losing the matching
+      // private key here would make that VM permanently unreachable. Stash it
+      // in the same in-memory map the success path uses (download endpoint
+      // doesn't care which path put it there) before wiping the temp dir.
+      if (!privateKeys.has(username)) {
+        await readFile(path.join(workDir, 'id_ed25519'), 'utf8')
+          .then((key) => privateKeys.set(username, key))
+          .catch(() => {});
+      }
+      await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
   }
 }
 
