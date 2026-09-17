@@ -28,17 +28,25 @@ function dropExpired() {
 export function createProvisioningToken({ username, role }) {
   dropExpired();
   const token = crypto.randomBytes(24).toString('hex');
-  sessions.set(token, { username, role, status: 'idle', events: [], createdAt: Date.now() });
+  sessions.set(token, { username, role, status: 'idle', vmReady: false, events: [], createdAt: Date.now() });
   return token;
 }
 
 // Records one deploy.sh step. status is one of "running" | "ok" | "error" |
 // "done" — deploy.sh decides which, this just relays it.
+//
+// vmReady latches true the first time VM creation itself reaches "done" and
+// never reverts - flSessionAuto.service.js keeps appending further events
+// (waiting for clients, starting the FL session) onto this same token after
+// that point, and `status` alone would flip back to "running" for those,
+// hiding the panel's SSH-key-download button again. vmReady is what the
+// panel should key that button's visibility on instead.
 export function appendProvisioningEvent({ token, step, command, status, message }) {
   const session = sessions.get(token);
   if (!session) return null;
   session.events.push({ step, command, status, message, at: new Date().toISOString() });
   session.status = status === 'error' ? 'error' : status === 'done' ? 'done' : 'running';
+  if (status === 'done' || status === 'error') session.vmReady = true;
   return session;
 }
 
@@ -47,6 +55,15 @@ export function appendProvisioningEvent({ token, step, command, status, message 
 // participant can hold sessions for both roles at once (a data-provider VM
 // and a user VM), so role must be part of the filter or one role's panel can
 // end up showing the other role's VM.
+// The provisioning session for one specific run, identified by its own
+// token - unlike getProvisioningStatusForUser's "most recent" heuristic
+// below, this can't pick the wrong run when several are in flight for the
+// same username+role at once (see vmAutoProvision.service.js's concurrent
+// runs).
+export function getProvisioningSession(token) {
+  return sessions.get(token) || null;
+}
+
 export function getProvisioningStatusForUser(username, role) {
   let latest = null;
   for (const session of sessions.values()) {
