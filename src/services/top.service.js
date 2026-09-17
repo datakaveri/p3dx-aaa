@@ -352,8 +352,11 @@ export async function respondToParticipationNotification({ notificationId, usern
 // list. finalize=false on the initial participation request, finalize=true on
 // the Final Roster send (only the confirmed/willing parties at that point).
 // Each party may carry dataset_name/data_url pulled from that provider's APD
-// form so the contract's data-provider entries aren't left blank.
-export async function buildSessionContract({ submissionId, outputOwnerUserId, parties, finalize }) {
+// form so the contract's data-provider entries aren't left blank. restart
+// (set by "Start Again", see /gov/restart-fl-session) mints a new
+// project_id/contract_id for the session instead of reusing the existing one,
+// so the restart shows up as its own project.
+export async function buildSessionContract({ submissionId, outputOwnerUserId, parties, finalize, restart }) {
   const url = buildTopUrl('/contracts');
   const resp = await axios.post(
     url,
@@ -362,6 +365,7 @@ export async function buildSessionContract({ submissionId, outputOwnerUserId, pa
       output_owner_user_id: outputOwnerUserId,
       parties,
       finalize: !!finalize,
+      restart: !!restart,
     },
     { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
   );
@@ -379,6 +383,48 @@ export async function getSessionContract({ sessionId }) {
   if (resp.status === 404) {
     return null;
   }
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// GET /contracts/by-project/{projectId} (contracts.go) — reads back the
+// contract for one specific project, not just a session's latest (a session
+// can have several projects/contracts now that every BuildContract call
+// mints a fresh project_id).
+export async function getContractByProject({ projectId }) {
+  const url = buildTopUrl(`/contracts/by-project/${encodeURIComponent(projectId)}`);
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
+  if (resp.status === 404) {
+    return null;
+  }
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// GET /projects/{sessionId} (projects.go) — reads back just the project_id
+// recorded for a session (participants stay internal to governance).
+export async function getProjectBySession({ sessionId }) {
+  const url = buildTopUrl(`/projects/${encodeURIComponent(sessionId)}`);
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
+  if (resp.status === 404) {
+    return null;
+  }
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// GET /projects?owner={username} (projects.go) — lists projects. owner unset
+// returns every project (fl-orchestrator's view); owner set scopes to that
+// output owner's own projects.
+export async function listProjects({ owner } = {}) {
+  const url = buildTopUrl(owner ? `/projects?owner=${encodeURIComponent(owner)}` : '/projects');
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
   if (resp.status < 200 || resp.status >= 300) {
     throw new Error(govLayerErrorMessage(resp));
   }

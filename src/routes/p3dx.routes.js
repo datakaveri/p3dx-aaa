@@ -44,14 +44,19 @@ import {
   respondToParticipationNotification,
   buildSessionContract,
   getSessionContract,
+  getContractByProject,
+  getProjectBySession,
+  listProjects,
 } from '../services/top.service.js';
 import { listProviderForms } from '../services/formSubmissions.service.js';
 import {
   createProvisioningToken,
   appendProvisioningEvent,
   getProvisioningStatusForUser,
+  getProvisioningSession,
 } from '../services/vmProvisioning.service.js';
 import { runAutoProvision, takePrivateKey, isProvisioning } from '../services/vmAutoProvision.service.js';
+import { registerExpectedProviders } from '../services/flSessionAuto.service.js';
 import {
   KEY_PAIR_ROLES,
   provisionDataProviderKeyPair,
@@ -1364,11 +1369,40 @@ router.post('/notify-roster', verifyJWT, async (req, res, next) => {
   }
 });
 
+// Shared by /gov/queue-fl-session and /gov/restart-fl-session: notifies the
+// fl-orchestrator operator account of a pending FL session start
+// (payload.kind: 'fl_session_pending') - see p3dx-auth-ui's
+// pages/fl_orchestrator/FL_Orchestrator.jsx, which lists these and does the
+// actual start-fl-session + Azure sign-in on the owner's behalf.
+async function queueFlSessionForOrchestrator({ submissionId, providers, vmName, outputOwnerUsername, adminToken }) {
+  const orchestratorId = await getUserId('fl-orchestrator', adminToken);
+
+  let projectId = null;
+  try {
+    const project = await getProjectBySession({ sessionId: submissionId });
+    projectId = project?.project_id || null;
+  } catch (err) {
+    console.warn('[P3DX_STEP_WARN] queue-fl-session: project lookup failed:', err.message || err);
+  }
+
+  await sendParticipationNotifications({
+    recipients: [{ id: orchestratorId, username: 'fl-orchestrator' }],
+    senderUsername: outputOwnerUsername,
+    message: `${outputOwnerUsername} requested to start the FL session for submission ${submissionId}.`,
+    payload: {
+      kind: 'fl_session_pending',
+      submission_id: submissionId,
+      participating_providers: providers,
+      vm_name: vmName || '',
+      output_owner_username: outputOwnerUsername,
+      project_id: projectId,
+    },
+  });
+}
+
 // POST /gov/queue-fl-session — output owner clicks "Start FL Session". Rather
 // than doing the Azure sign-in themselves, this just queues the request for
-// the fl-orchestrator operator account (payload.kind: 'fl_session_pending')
-// - see p3dx-auth-ui's pages/fl_orchestrator/FL_Orchestrator.jsx, which lists these and does the actual
-// start-fl-session + Azure sign-in below on the owner's behalf.
+// the fl-orchestrator operator account via queueFlSessionForOrchestrator above.
 router.post('/gov/queue-fl-session', verifyJWT, async (req, res, next) => {
   try {
     const { submission_id, participating_providers, vm_name } = req.body || {};
@@ -1382,19 +1416,13 @@ router.post('/gov/queue-fl-session', verifyJWT, async (req, res, next) => {
 
     const outputOwnerUsername = req.user?.preferred_username;
     const adminToken = await getAdminToken();
-    const orchestratorId = await getUserId('fl-orchestrator', adminToken);
 
-    await sendParticipationNotifications({
-      recipients: [{ id: orchestratorId, username: 'fl-orchestrator' }],
-      senderUsername: outputOwnerUsername,
-      message: `${outputOwnerUsername} requested to start the FL session for submission ${submission_id}.`,
-      payload: {
-        kind: 'fl_session_pending',
-        submission_id,
-        participating_providers: providers,
-        vm_name: vm_name || '',
-        output_owner_username: outputOwnerUsername,
-      },
+    await queueFlSessionForOrchestrator({
+      submissionId: submission_id,
+      providers,
+      vmName: vm_name,
+      outputOwnerUsername,
+      adminToken,
     });
 
     console.log('[P3DX_STEP_OK] queue-fl-session: queued for fl-orchestrator', {
@@ -1402,6 +1430,111 @@ router.post('/gov/queue-fl-session', verifyJWT, async (req, res, next) => {
     });
 
     return res.status(200).json({ status: 'SUCCESS' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /gov/restart-fl-session — "Start Again" from the owner's Projects page
+// (ProjectsList.jsx): re-queues the same session for the fl-orchestrator with
+// the same data-provider roster, without redoing invite/accept. The Projects
+// list only carries provider usernames (not Keycloak ids), so resolve each to
+// an id here via getUserId before handing off to queueFlSessionForOrchestrator.
+// Unlike the first-time "Start FL Session", this also builds a fresh contract
+// (restart: true) so the restart gets its own project_id/contract_id instead
+// of overwriting the previous project's row - each restart is its own project
+// with its own contract, even though it reuses the same session/parties.
+router.post('/gov/restart-fl-session', verifyJWT, async (req, res, next) => {
+  try {
+    const { submission_id, provider_usernames } = req.body || {};
+    if (!submission_id) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_SUBMISSION_ID' });
+    }
+    const usernames = Array.isArray(provider_usernames) ? provider_usernames.filter(Boolean) : [];
+    if (usernames.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_PARTICIPATING_PROVIDERS' });
+    }
+
+    const adminToken = await getAdminToken();
+    const providers = [];
+    for (const username of usernames) {
+      try {
+        const id = await getUserId(username, adminToken);
+        providers.push({ id, username });
+      } catch (err) {
+        console.warn('[P3DX_STEP_WARN] restart-fl-session: provider lookup failed:', username, err.message || err);
+      }
+    }
+    if (providers.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'PROVIDERS_NOT_FOUND' });
+    }
+
+    const outputOwnerUsername = req.user?.preferred_username;
+
+    // Build a new project + contract for this restart, same as notify-roster's
+    // final-roster contract build, but forcing a fresh project_id/contract_id
+    // instead of reusing the session's existing one.
+    let contractError = null;
+    try {
+      const providerForms = await listProviderForms();
+      const formByOwner = new Map();
+      for (const form of providerForms) {
+        const owner = form.data_owner_id;
+        if (owner && !formByOwner.has(owner)) formByOwner.set(owner, form);
+      }
+      const parties = providers.map(p => {
+        const form = formByOwner.get(p.username);
+        return {
+          id: p.id,
+          username: p.username,
+          dataset_name: form?.dataset_name || '',
+          data_url: form?.dataset_location_url || '',
+        };
+      });
+      const contractResult = await buildSessionContract({
+        submissionId: submission_id,
+        outputOwnerUserId: req.user?.sub,
+        parties,
+        finalize: true,
+        restart: true,
+      });
+      console.log('[P3DX_STEP_OK] restart-fl-session: new project/contract created', {
+        submission_id, contract_id: contractResult?.contract_id,
+      });
+    } catch (err) {
+      contractError = err.message || 'Failed to build restart contract';
+      console.warn('[P3DX_STEP_WARN] restart-fl-session: contract build failed:', contractError);
+    }
+
+    // Tell the providers up front that this is a reuse of the same contract,
+    // before it even reaches the orchestrator's queue below.
+    await sendParticipationNotifications({
+      recipients: providers.map(p => ({ id: p.id, username: p.username })),
+      senderUsername: outputOwnerUsername,
+      message: `${outputOwnerUsername} is using the same contract and starting the FL session for submission ${submission_id} again.`,
+      payload: {
+        kind: 'fl_session_restart',
+        submission_id,
+        output_owner_username: outputOwnerUsername,
+      },
+    });
+
+    // From here it's the exact same path as a first-time "Start FL Session":
+    // queue to the fl-orchestrator, who signs in with Azure and provisions
+    // the VM, then calls start-fl-session to notify providers to join.
+    await queueFlSessionForOrchestrator({
+      submissionId: submission_id,
+      providers,
+      vmName: '',
+      outputOwnerUsername,
+      adminToken,
+    });
+
+    console.log('[P3DX_STEP_OK] restart-fl-session: notified providers and re-queued for fl-orchestrator', {
+      owner: outputOwnerUsername, submission_id,
+    });
+
+    return res.status(200).json({ status: 'SUCCESS', contract_error: contractError });
   } catch (err) {
     next(err);
   }
@@ -1448,6 +1581,10 @@ router.post('/gov/start-fl-session', verifyJWT, async (req, res, next) => {
     console.log('[P3DX_STEP_OK] start-fl-session: notified', {
       sender: senderUsername, recipients: recipients.length, submission_id,
     });
+
+    // Once the owner's server VM is up too, flSessionAuto.service.js polls
+    // for this many connected clients before auto-starting the FL session.
+    registerExpectedProviders(submission_id, recipients.length);
 
     return res.status(200).json({
       status: 'SUCCESS',
@@ -1498,6 +1635,36 @@ router.get('/contract/:sessionId', verifyJWT, async (req, res, next) => {
       return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND', message: 'No contract for this session' });
     }
     return res.json(contract);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /contract/by-project/:projectId — read back the contract for one
+// specific project. A session can have several projects now (draft, final,
+// and any "Start Again" restarts each mint their own project_id/contract),
+// so this is how the Projects page views the exact contract behind one card.
+router.get('/contract/by-project/:projectId', verifyJWT, async (req, res, next) => {
+  try {
+    const contract = await getContractByProject({ projectId: req.params.projectId });
+    if (!contract) {
+      return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND', message: 'No contract for this project' });
+    }
+    return res.json(contract);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /projects — the caller's own Projects list. The fl-orchestrator role
+// sees every project; anyone else sees only their own (as output owner).
+router.get('/projects', verifyJWT, async (req, res, next) => {
+  try {
+    const roles = req.user?.realm_access?.roles || [];
+    const isOrchestrator = roles.includes('fl-orchestrator');
+    const owner = isOrchestrator ? undefined : req.user?.preferred_username;
+    const result = await listProjects({ owner });
+    return res.json({ status: 'SUCCESS', projects: result?.projects || [] });
   } catch (err) {
     next(err);
   }
@@ -1604,29 +1771,39 @@ router.post('/vm-provisioning/auto-create', verifyJWT, async (req, res) => {
   if (!vmName) {
     return res.status(400).json({ status: 'FAILED', error: 'MISSING_VM_NAME' });
   }
+  // runKey identifies this specific caller/panel instance (falls back to
+  // username for older callers) - it's what guards against a duplicate
+  // spawn of the *same* run, not against different concurrent runs. See
+  // vmAutoProvision.service.js's activeRunKeys.
+  const runKey = typeof req.body?.runKey === 'string' && req.body.runKey ? req.body.runKey : username;
+  // Ties this VM run to an FL submission, if any, so flSessionAuto.service.js
+  // can fan "waiting for clients"/"starting FL session" events onto this same
+  // provisioning token once every selected provider has connected.
+  const submissionId = typeof req.body?.submissionId === 'string' && req.body.submissionId ? req.body.submissionId : null;
 
-  // A run for this user is already in flight (e.g. a duplicate mount, or a
+  // A run for this runKey is already in flight (e.g. a duplicate mount, or a
   // retry click before the first one finished) - don't spawn a second
-  // `az login`/terraform run; the existing one is still streaming to the
-  // same SSE subscription (keyed by username), so there's nothing more to do.
-  if (isProvisioning(username)) {
+  // `az login`/terraform run for it. Different runKeys (other pending
+  // requests) are unaffected and run concurrently.
+  if (isProvisioning(runKey)) {
     return res.status(202).json({ status: 'SUCCESS', already_running: true });
   }
 
   const token = createProvisioningToken({ username, role });
   res.status(202).json({ status: 'SUCCESS', token });
-  runAutoProvision({ token, username, role, vmName }).catch((err) => {
+  runAutoProvision({ token, username, role, vmName, runKey, submissionId }).catch((err) => {
     console.error('[vm-auto-provision] unhandled failure:', err);
   });
 });
 
 // GET /vm-provisioning/private-key — one-time download of the SSH private
-// key generated for the caller's most recently auto-created VM. JWT-authed
+// key generated for one specific auto-created VM run, identified by its
+// provisioning token (from the auto-create response above). JWT-authed
 // (unlike the token-authed routes below) since this is called straight from
 // the browser, not by a headless script.
 router.get('/vm-provisioning/private-key', verifyJWT, (req, res) => {
-  const username = req.user?.preferred_username;
-  const key = username && takePrivateKey(username);
+  const runToken = String(req.query.token || '').trim();
+  const key = runToken && takePrivateKey(runToken);
   if (!key) {
     return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND_OR_ALREADY_DOWNLOADED' });
   }
@@ -1666,14 +1843,19 @@ router.post('/vm-provisioning/events', async (req, res) => {
   return res.status(200).json({ status: 'SUCCESS' });
 });
 
-// GET /vm-provisioning/stream — SSE push of the caller's VM provisioning
+// GET /vm-provisioning/stream — SSE push of one run's VM provisioning
 // events, same poll-and-forward pattern as /notifications/stream above
-// (EventSource can't set an Authorization header, so this takes username as
-// a query param rather than a JWT). Sends the full event log each time it
-// changes — traffic is tiny and short-lived, so no need to diff.
+// (EventSource can't set an Authorization header, so this takes identifying
+// info as query params rather than a JWT). Prefer ?token= (identifies one
+// specific run unambiguously - see vmProvisioning.service.js's
+// getProvisioningSession); ?username=&role= falls back to "most recent run
+// for this username+role", kept for the manual deploy.sh flow which never
+// has a token. Sends the full event log each time it changes — traffic is
+// tiny and short-lived, so no need to diff.
 router.get('/vm-provisioning/stream', async (req, res) => {
+  const runToken = String(req.query.token || '').trim();
   const username = String(req.query.username || '').trim();
-  if (!username) {
+  if (!runToken && !username) {
     return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
   }
   const role = req.query.role === 'data-provider' ? 'data-provider' : 'user';
@@ -1687,10 +1869,10 @@ router.get('/vm-provisioning/stream', async (req, res) => {
 
   let lastCount = -1;
   const poll = () => {
-    const session = getProvisioningStatusForUser(username, role);
+    const session = runToken ? getProvisioningSession(runToken) : getProvisioningStatusForUser(username, role);
     const events = session?.events || [];
     if (events.length !== lastCount) {
-      res.write(`data: ${JSON.stringify({ status: session?.status || 'idle', events })}\n\n`);
+      res.write(`data: ${JSON.stringify({ status: session?.status || 'idle', vmReady: Boolean(session?.vmReady), events })}\n\n`);
       lastCount = events.length;
     }
   };
