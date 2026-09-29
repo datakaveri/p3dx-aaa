@@ -1,117 +1,86 @@
-import { generateKeyPairSync } from 'crypto';
-import { getImmuDBClient, logAuditEvent } from './immudb.service.js';
-import { getAdminToken, setUserAttribute } from './keycloak.service.js';
+import { createHash, createPublicKey } from 'crypto';
+import { logAuditEvent } from './immudb.service.js';
+import { getAdminToken, getUserById, setUserAttribute } from './keycloak.service.js';
 
 // The realm's Keycloak User Profile only persists attributes it has declared
-// (undeclared ones are silently stripped on save) — "public-key" is the one
-// already declared there.
-const PUBLIC_KEY_ATTRIBUTE = 'public-key';
+// (undeclared ones are silently stripped on save) — "public_key" is the one
+// declared there.
+const PUBLIC_KEY_ATTRIBUTE = 'public_key';
+
+const MIN_MODULUS_BITS = 2048;
 
 export const KEY_PAIR_ROLES = new Set(['data-provider', 'infra-provider']);
 
-// One key pair per USER: Keycloak only has one "public-key" attribute slot,
-// so a returning data-provider always reuses their existing key pair rather
-// than generating a new one and overwriting the public key while the old
-// private key stays on disk, leaving a mismatched pair.
-function keyStoreKey(userId) {
-  return `dp-keypair:${userId}`;
-}
+// One key pair per USER, generated in the provider's browser (see
+// p3dx-auth-ui api/keyPair.js). The platform never sees or stores the
+// private key — only the public half is uploaded, and it lives solely in the
+// user's Keycloak "public_key" attribute, where gov_layer's userdir reads it
+// to verify contract-hash signatures. Nothing key-related goes to immuDB.
+
+export class InvalidPublicKeyError extends Error {}
 
 /**
- * Ensure a key pair exists for this user, right after a KEY_PAIR_ROLES role
- * (data-provider, infra-provider) is granted. If the user already has a key
- * pair, it's reused as-is — the public key is already on their Keycloak
- * profile. Otherwise a fresh RSA pair is generated: the public half published
- * to Keycloak immediately, the private half held in immuDB (never logged,
- * never returned from a list endpoint, never rendered).
+ * Validate a PEM public key uploaded by the provider and publish it to their
+ * Keycloak profile, replacing any previous one. Must be an RSA SPKI
+ * ("-----BEGIN PUBLIC KEY-----") key of at least 2048 bits — the format
+ * gov_layer parses with x509.ParsePKIXPublicKey and verifies with
+ * RSASSA-PKCS1-v1_5 / SHA-256.
  */
-export async function provisionDataProviderKeyPair({ userId, roleName }) {
-  if (!KEY_PAIR_ROLES.has(roleName)) {
-    return null;
+export async function registerPublicKey({ userId, roleName, publicKeyPem }) {
+  if (typeof publicKeyPem !== 'string' || !publicKeyPem.trim()) {
+    throw new InvalidPublicKeyError('MISSING_PUBLIC_KEY');
+  }
+  // Refuse outright if a private key was pasted/uploaded by mistake, so it
+  // can't end up in logs or Keycloak.
+  if (/PRIVATE KEY/.test(publicKeyPem)) {
+    throw new InvalidPublicKeyError('PRIVATE_KEY_NOT_ACCEPTED');
+  }
+  if (!/^-----BEGIN PUBLIC KEY-----[\s\S]+-----END PUBLIC KEY-----\s*$/.test(publicKeyPem.trim())) {
+    throw new InvalidPublicKeyError('EXPECTED_SPKI_PEM');
   }
 
-  const existing = await getPrivateKeyRecord({ userId });
-  if (existing?.private_key_pem) {
-    const roles = Array.from(new Set([...(existing.roles || [existing.role_name].filter(Boolean)), roleName]));
-    const client = getImmuDBClient();
-    if (client && roles.length !== (existing.roles || []).length) {
-      await client.set({ key: keyStoreKey(userId), value: JSON.stringify({ ...existing, roles }) });
-    }
-    return { publicKey: existing.public_key_pem };
+  let keyObject;
+  try {
+    keyObject = createPublicKey({ key: publicKeyPem, format: 'pem' });
+  } catch {
+    throw new InvalidPublicKeyError('INVALID_PUBLIC_KEY');
+  }
+  if (keyObject.asymmetricKeyType !== 'rsa') {
+    throw new InvalidPublicKeyError('EXPECTED_RSA_KEY');
+  }
+  if ((keyObject.asymmetricKeyDetails?.modulusLength || 0) < MIN_MODULUS_BITS) {
+    throw new InvalidPublicKeyError('KEY_TOO_SHORT');
   }
 
-  const { publicKey, privateKey } = generateKeyPairSync('rsa', {
-    modulusLength: 2048,
-    publicKeyEncoding: { type: 'spki', format: 'pem' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-  });
+  // Re-export so what's stored is a normalised SPKI PEM.
+  const normalisedPem = keyObject.export({ type: 'spki', format: 'pem' });
+  const fingerprint = createHash('sha256')
+    .update(keyObject.export({ type: 'spki', format: 'der' }))
+    .digest('hex');
 
   const adminToken = await getAdminToken();
-  await setUserAttribute(userId, PUBLIC_KEY_ATTRIBUTE, publicKey, adminToken);
+  const hadKey = Boolean(await readPublicKey(userId, adminToken));
+  await setUserAttribute(userId, PUBLIC_KEY_ATTRIBUTE, normalisedPem, adminToken);
 
-  const client = getImmuDBClient();
-  if (client) {
-    const timestamp = Date.now();
-    const record = {
-      user_id: userId,
-      roles: [roleName],
-      public_key_pem: publicKey,
-      private_key_pem: privateKey,
-      created_at: timestamp,
-      created_at_iso: new Date(timestamp).toISOString(),
-      download_count: 0,
-      last_downloaded_at: null,
-    };
-    await client.set({ key: keyStoreKey(userId), value: JSON.stringify(record) });
-  }
-
-  await logAuditEvent('DATA_PROVIDER_KEYPAIR_GENERATED', userId, {
+  await logAuditEvent(hadKey ? 'PROVIDER_PUBLIC_KEY_ROTATED' : 'PROVIDER_PUBLIC_KEY_REGISTERED', userId, {
     roleName,
+    fingerprint_sha256: fingerprint,
     timestamp: new Date().toISOString(),
   });
 
-  return { publicKey };
+  return { fingerprint };
 }
 
-export async function getPrivateKeyRecord({ userId }) {
-  const client = getImmuDBClient();
-  if (!client) {
-    return null;
-  }
-
-  try {
-    const res = await client.get({ key: keyStoreKey(userId) });
-    const value = res?.value;
-    if (!value) {
-      return null;
-    }
-    const json = Buffer.isBuffer(value) ? value.toString('utf8') : String(value);
-    return JSON.parse(json);
-  } catch {
-    return null;
-  }
+/**
+ * Whether the user has a public key registered in Keycloak.
+ */
+export async function getPublicKeyStatus({ userId }) {
+  const adminToken = await getAdminToken();
+  return { exists: Boolean(await readPublicKey(userId, adminToken)) };
 }
 
-// The private key stays available for repeat downloads (the user may lose
-// the file, switch machines, etc.) — this just tracks download history for
-// audit purposes, it never removes the key from storage.
-export async function recordPrivateKeyDownload({ userId }) {
-  const client = getImmuDBClient();
-  if (!client) {
-    return;
-  }
-
-  const current = await getPrivateKeyRecord({ userId });
-  if (!current) {
-    return;
-  }
-
-  const timestamp = Date.now();
-  const updated = {
-    ...current,
-    download_count: (current.download_count || 0) + 1,
-    last_downloaded_at: timestamp,
-  };
-
-  await client.set({ key: keyStoreKey(userId), value: JSON.stringify(updated) });
+async function readPublicKey(userId, adminToken) {
+  const user = await getUserById(userId, adminToken);
+  const value = user?.attributes?.[PUBLIC_KEY_ATTRIBUTE];
+  return Array.isArray(value) ? value[0] || null : value || null;
 }

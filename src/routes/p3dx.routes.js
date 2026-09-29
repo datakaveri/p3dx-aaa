@@ -42,6 +42,8 @@ import {
   getSentNotifications,
   markParticipationNotificationRead,
   respondToParticipationNotification,
+  submitTeeContractSignature,
+  getTeeContractSignatures,
   buildSessionContract,
   getSessionContract,
   getContractByProject,
@@ -49,25 +51,26 @@ import {
   listProjects,
 } from '../services/top.service.js';
 import { listProviderForms } from '../services/formSubmissions.service.js';
-import {
-  createProvisioningToken,
-  appendProvisioningEvent,
-  getProvisioningStatusForUser,
-  getProvisioningSession,
-} from '../services/vmProvisioning.service.js';
-import { runAutoProvision, takePrivateKey, isProvisioning } from '../services/vmAutoProvision.service.js';
-import { registerExpectedProviders } from '../services/flSessionAuto.service.js';
+import axios from 'axios';
 import {
   KEY_PAIR_ROLES,
-  provisionDataProviderKeyPair,
-  getPrivateKeyRecord,
-  recordPrivateKeyDownload,
+  InvalidPublicKeyError,
+  registerPublicKey,
+  getPublicKeyStatus,
 } from '../services/keyPair.service.js';
 
 const router = Router();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// p3dx-fl-orchestrator (Azure/Terraform VM provisioning + the FL auto-start
+// post-flow, moved out of this service). ORCHESTRATOR_SERVICE_URL is where
+// /gov/start-fl-session below reports the expected-provider count once it's
+// notified everyone; INTERNAL_SERVICE_KEY must match that service's own env
+// var of the same name.
+const ORCHESTRATOR_SERVICE_URL = process.env.ORCHESTRATOR_SERVICE_URL || 'http://localhost:3002';
+const INTERNAL_SERVICE_KEY = process.env.INTERNAL_SERVICE_KEY || '';
 
 async function loadComposeUrlsConfig() {
   const configPath = path.resolve(__dirname, '..', 'config', 'compose-urls.json');
@@ -473,7 +476,10 @@ router.post('/workloads/preview-contract', verifyJWT, requireRole('user'), async
 // https URL the CVM's managed identity can read.
 router.post('/workloads/tee-sessions', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {
-    const { datasetUrl, datasetId, datasetName } = req.body || {};
+    const { datasetUrl, datasetId, datasetName, contractId } = req.body || {};
+    if (!contractId || typeof contractId !== 'string') {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_CONTRACT_ID' });
+    }
     if (!datasetUrl || typeof datasetUrl !== 'string') {
       return res.status(400).json({ status: 'FAILED', error: 'MISSING_DATASET_URL' });
     }
@@ -492,6 +498,7 @@ router.post('/workloads/tee-sessions', verifyJWT, requireRole('user'), async (re
       datasetId,
       datasetName,
       consumerId: req.user?.preferred_username || req.user?.sub,
+      governanceContractId: contractId,
     });
 
     console.log('[P3DX_STEP_OK] workloads/tee-sessions: TEE session started', {
@@ -503,6 +510,21 @@ router.post('/workloads/tee-sessions', verifyJWT, requireRole('user'), async (re
   } catch (err) {
     if (err.status) {
       return res.status(err.status).json({ status: 'FAILED', error: err.message });
+    }
+    next(err);
+  }
+});
+
+// GET /workloads/tee-contracts/:contractId/signatures — lets the consumer who
+// generated a TEE contract see which data providers have signed it. A TEE
+// can't run (POST /workloads/tee-sessions) until all_signed is true.
+router.get('/workloads/tee-contracts/:contractId/signatures', verifyJWT, requireRole('user'), async (req, res, next) => {
+  try {
+    const result = await getTeeContractSignatures({ contractId: req.params.contractId });
+    return res.json(result);
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json(err.data || { status: 'FAILED', error: err.message });
     }
     next(err);
   }
@@ -1127,14 +1149,8 @@ router.post(
       if (String(decision).toUpperCase() === 'APPROVE') {
         const adminToken = await getAdminToken();
         await assignRealmRole(updated.user_id, updated.role_name, adminToken);
-
-        if (KEY_PAIR_ROLES.has(updated.role_name)) {
-          try {
-            await provisionDataProviderKeyPair({ userId: updated.user_id, roleName: updated.role_name });
-          } catch (err) {
-            console.error('[keypair] Failed to provision data-provider key pair:', err.message);
-          }
-        }
+        // No key pair is created here — the provider generates it in their
+        // own browser and registers just the public key (POST /keys/:roleName/public-key).
       }
 
       return res.json({ status: 'SUCCESS', request: updated });
@@ -1148,11 +1164,10 @@ router.post(
   }
 );
 
-// Whether a data-provider key pair exists for the caller. One key pair is
-// shared across both data-provider roles, so the lookup is per-user — the
-// :roleName segment is kept in the URL only to gate on the caller actually
-// holding that role. Lets the UI decide whether to show the "Download
-// Private Key" button.
+// Whether the caller has a public key registered. The key pair is per-user
+// (shared across KEY_PAIR_ROLES), so the lookup is per-user — the :roleName
+// segment only gates on the caller actually holding that role. Lets the UI
+// choose between "Generate Key Pair" and "Regenerate Key Pair".
 router.get('/keys/:roleName/status', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {
     const roleName = req.params.roleName;
@@ -1160,24 +1175,18 @@ router.get('/keys/:roleName/status', verifyJWT, requireRole('user'), async (req,
       return res.status(400).json({ status: 'FAILED', error: 'ROLE_NOT_ALLOWED' });
     }
 
-    const record = await getPrivateKeyRecord({ userId: req.user.sub });
-    return res.json({
-      status: 'SUCCESS',
-      exists: Boolean(record),
-      download_count: record?.download_count || 0,
-    });
+    const { exists } = await getPublicKeyStatus({ userId: req.user.sub });
+    return res.json({ status: 'SUCCESS', exists });
   } catch (err) {
     next(err);
   }
 });
 
-// Private key download. The key is streamed straight to the response as a
-// file attachment (never returned as JSON, never rendered) and stays
-// available for repeat downloads — the user may lose the file, switch
-// machines, etc. Each download is still audit-logged. The same private key
-// is served regardless of which KEY_PAIR_ROLES role's URL is used, since
-// every such role shares one key pair for a given user.
-router.get('/keys/:roleName/private-key', verifyJWT, requireRole('user'), async (req, res, next) => {
+// Register (or replace) the caller's public key. The key pair is generated
+// in the provider's browser and the private key is saved straight to their
+// disk — only the SPKI public key PEM arrives here, and it is stored solely
+// in Keycloak's "public_key" attribute. The platform never holds a private key.
+router.post('/keys/:roleName/public-key', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {
     const roleName = req.params.roleName;
     if (!KEY_PAIR_ROLES.has(roleName)) {
@@ -1189,23 +1198,16 @@ router.get('/keys/:roleName/private-key', verifyJWT, requireRole('user'), async 
       return res.status(403).json({ status: 'FAILED', error: 'INSUFFICIENT_ROLE' });
     }
 
-    const record = await getPrivateKeyRecord({ userId: req.user.sub });
-    if (!record || !record.private_key_pem) {
-      return res.status(404).json({ status: 'FAILED', error: 'KEY_NOT_FOUND' });
-    }
-
-    await recordPrivateKeyDownload({ userId: req.user.sub });
-
-    await logAuditEvent('DATA_PROVIDER_PRIVATE_KEY_DOWNLOADED', req.user.sub, {
+    const { fingerprint } = await registerPublicKey({
+      userId: req.user.sub,
       roleName,
-      ip: req.ip,
-      timestamp: new Date().toISOString(),
+      publicKeyPem: req.body?.publicKeyPem,
     });
-
-    res.setHeader('Content-Type', 'application/x-pem-file');
-    res.setHeader('Content-Disposition', `attachment; filename="${roleName}-private-key.pem"`);
-    return res.status(200).send(record.private_key_pem);
+    return res.json({ status: 'SUCCESS', fingerprint_sha256: fingerprint });
   } catch (err) {
+    if (err instanceof InvalidPublicKeyError) {
+      return res.status(400).json({ status: 'FAILED', error: err.message });
+    }
     next(err);
   }
 });
@@ -1582,9 +1584,18 @@ router.post('/gov/start-fl-session', verifyJWT, async (req, res, next) => {
       sender: senderUsername, recipients: recipients.length, submission_id,
     });
 
-    // Once the owner's server VM is up too, flSessionAuto.service.js polls
-    // for this many connected clients before auto-starting the FL session.
-    registerExpectedProviders(submission_id, recipients.length);
+    // Once the owner's server VM is up too, p3dx-fl-orchestrator's flauto
+    // package polls for this many connected clients before auto-starting the
+    // FL session (moved out of this service — see SCL-fl-orchestrator-split).
+    // Best-effort: a momentarily-down orchestrator shouldn't fail the
+    // provider-notify step above, which already succeeded.
+    axios.post(
+      `${ORCHESTRATOR_SERVICE_URL}/p3dx/internal/register-expected-providers`,
+      { submissionId: submission_id, count: recipients.length },
+      { headers: { 'X-Internal-Key': INTERNAL_SERVICE_KEY }, timeout: 5000 },
+    ).catch((err) => {
+      console.warn('[P3DX_STEP_WARN] start-fl-session: register-expected-providers failed:', err.message || err);
+    });
 
     return res.status(200).json({
       status: 'SUCCESS',
@@ -1754,139 +1765,12 @@ router.get('/notifications/stream', async (req, res) => {
   });
 });
 
-// POST /vm-provisioning/auto-create — fully automated VM creation: kicks off
-// `az login --use-device-code` (isolated per participant) followed by
-// Terraform, driven by that participant's own freshly-authenticated Azure
-// CLI session. Responds immediately with a token identifying this run;
-// progress (including the device code to enter) streams over
-// /vm-provisioning/stream below. See vmAutoProvision.service.js for why this
-// can't just reuse the browser's MSAL token.
-router.post('/vm-provisioning/auto-create', verifyJWT, async (req, res) => {
-  const username = req.user?.preferred_username;
-  if (!username) {
-    return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
-  }
-  const role = req.body?.role === 'data-provider' ? 'data-provider' : 'user';
-  const vmName = typeof req.body?.vmName === 'string' ? req.body.vmName.trim() : '';
-  if (!vmName) {
-    return res.status(400).json({ status: 'FAILED', error: 'MISSING_VM_NAME' });
-  }
-  // runKey identifies this specific caller/panel instance (falls back to
-  // username for older callers) - it's what guards against a duplicate
-  // spawn of the *same* run, not against different concurrent runs. See
-  // vmAutoProvision.service.js's activeRunKeys.
-  const runKey = typeof req.body?.runKey === 'string' && req.body.runKey ? req.body.runKey : username;
-  // Ties this VM run to an FL submission, if any, so flSessionAuto.service.js
-  // can fan "waiting for clients"/"starting FL session" events onto this same
-  // provisioning token once every selected provider has connected.
-  const submissionId = typeof req.body?.submissionId === 'string' && req.body.submissionId ? req.body.submissionId : null;
-
-  // A run for this runKey is already in flight (e.g. a duplicate mount, or a
-  // retry click before the first one finished) - don't spawn a second
-  // `az login`/terraform run for it. Different runKeys (other pending
-  // requests) are unaffected and run concurrently.
-  if (isProvisioning(runKey)) {
-    return res.status(202).json({ status: 'SUCCESS', already_running: true });
-  }
-
-  const token = createProvisioningToken({ username, role });
-  res.status(202).json({ status: 'SUCCESS', token });
-  runAutoProvision({ token, username, role, vmName, runKey, submissionId }).catch((err) => {
-    console.error('[vm-auto-provision] unhandled failure:', err);
-  });
-});
-
-// GET /vm-provisioning/private-key — one-time download of the SSH private
-// key generated for one specific auto-created VM run, identified by its
-// provisioning token (from the auto-create response above). JWT-authed
-// (unlike the token-authed routes below) since this is called straight from
-// the browser, not by a headless script.
-router.get('/vm-provisioning/private-key', verifyJWT, (req, res) => {
-  const runToken = String(req.query.token || '').trim();
-  const key = runToken && takePrivateKey(runToken);
-  if (!key) {
-    return res.status(404).json({ status: 'FAILED', error: 'NOT_FOUND_OR_ALREADY_DOWNLOADED' });
-  }
-  res.setHeader('Content-Type', 'application/x-pem-file');
-  res.setHeader('Content-Disposition', 'attachment; filename="p3dx_flo_vm_key.pem"');
-  res.send(key);
-});
-
-// POST /vm-provisioning/token — mint a short-lived token identifying the
-// caller, so their local `terraform/participant-vm/deploy.sh` run can report
-// progress back to their own FL dashboard. deploy.sh runs on the
-// participant's own machine against their own Azure subscription — this
-// backend never sees or needs their Azure credentials, only these status
-// pings. See vmProvisioning.service.js.
-router.post('/vm-provisioning/token', verifyJWT, async (req, res) => {
-  const username = req.user?.preferred_username;
-  if (!username) {
-    return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
-  }
-  const role = req.body?.role === 'data-provider' ? 'data-provider' : 'user';
-  const token = createProvisioningToken({ username, role });
-  return res.status(201).json({ status: 'SUCCESS', token });
-});
-
-// POST /vm-provisioning/events — deploy.sh posts one event per step here.
-// Token-authenticated rather than JWT-authenticated: the caller is a local
-// shell script with no browser session, just the token minted above.
-router.post('/vm-provisioning/events', async (req, res) => {
-  const { token, step, command, status, message } = req.body || {};
-  if (!token || !step || !status) {
-    return res.status(400).json({ status: 'FAILED', error: 'MISSING_FIELDS' });
-  }
-  const session = appendProvisioningEvent({ token, step, command, status, message });
-  if (!session) {
-    return res.status(404).json({ status: 'FAILED', error: 'UNKNOWN_OR_EXPIRED_TOKEN' });
-  }
-  return res.status(200).json({ status: 'SUCCESS' });
-});
-
-// GET /vm-provisioning/stream — SSE push of one run's VM provisioning
-// events, same poll-and-forward pattern as /notifications/stream above
-// (EventSource can't set an Authorization header, so this takes identifying
-// info as query params rather than a JWT). Prefer ?token= (identifies one
-// specific run unambiguously - see vmProvisioning.service.js's
-// getProvisioningSession); ?username=&role= falls back to "most recent run
-// for this username+role", kept for the manual deploy.sh flow which never
-// has a token. Sends the full event log each time it changes — traffic is
-// tiny and short-lived, so no need to diff.
-router.get('/vm-provisioning/stream', async (req, res) => {
-  const runToken = String(req.query.token || '').trim();
-  const username = String(req.query.username || '').trim();
-  if (!runToken && !username) {
-    return res.status(400).json({ status: 'FAILED', error: 'MISSING_USERNAME' });
-  }
-  const role = req.query.role === 'data-provider' ? 'data-provider' : 'user';
-
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    Connection: 'keep-alive',
-  });
-  res.write('\n');
-
-  let lastCount = -1;
-  const poll = () => {
-    const session = runToken ? getProvisioningSession(runToken) : getProvisioningStatusForUser(username, role);
-    const events = session?.events || [];
-    if (events.length !== lastCount) {
-      res.write(`data: ${JSON.stringify({ status: session?.status || 'idle', vmReady: Boolean(session?.vmReady), events })}\n\n`);
-      lastCount = events.length;
-    }
-  };
-
-  poll();
-  const pollInterval = setInterval(poll, 2000);
-  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000);
-
-  req.on('close', () => {
-    clearInterval(pollInterval);
-    clearInterval(heartbeat);
-    res.end();
-  });
-});
+// The /vm-provisioning/* routes (auto-create, private-key, token, events,
+// stream) used to live here. They now live in p3dx-fl-orchestrator
+// (Go, port 3002) along with the Azure/Terraform provisioning engine and the
+// terraform/ config itself — see that service's internal/httpapi package.
+// p3dx-auth-ui's src/api/vmProvisioning.js calls it directly at
+// VITE_ORCHESTRATOR_URL; nothing in this file proxies it anymore.
 
 // POST /notifications/:id/read — mark one of the caller's own notifications read.
 router.post('/notifications/:id/read', verifyJWT, async (req, res, next) => {
@@ -1918,6 +1802,77 @@ router.post('/notifications/:id/respond', verifyJWT, async (req, res, next) => {
       notificationId: req.params.id, username, response, message: message || '',
     });
     console.log('[P3DX_STEP_OK] notifications/respond:', { username, response, id: req.params.id });
+    return res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// --- TEE contract signing -------------------------------------------------
+// When a consumer generates a TEE contract, gov_layer hashes it and sends
+// the hash + contract to each participating data provider as a
+// TEE_CONTRACT_SIGN notification addressed to their provider_id
+// ("provider-<slug(username)>", the same id their APD dataset policies carry).
+// The provider signs the hash in the browser with the private key they
+// generated locally; the platform never holds or receives that private key.
+
+function callerProviderId(req) {
+  return `provider-${slugify(req.user?.preferred_username || req.user?.email)}`;
+}
+
+// GET /tee-contracts/sign-requests — the caller's TEE contract sign requests.
+router.get('/tee-contracts/sign-requests', verifyJWT, async (req, res, next) => {
+  try {
+    const roles = req.user?.realm_access?.roles || [];
+    if (!roles.includes('data-provider')) {
+      return res.status(403).json({ status: 'FAILED', error: 'INSUFFICIENT_ROLE' });
+    }
+    const notifications = await getRecipientNotifications({ username: callerProviderId(req) });
+    const requests = notifications.filter(n => n?.payload?.type === 'TEE_CONTRACT_SIGN');
+    return res.json({ status: 'SUCCESS', requests });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /tee-contracts/:contractId/sign — body { notificationId, contractHash,
+// signature (base64) }. Forwards the caller's verified Keycloak username;
+// gov_layer maps it to their provider_id and verifies the signature with the
+// public key Keycloak holds for them, against its own copy of the hash.
+router.post('/tee-contracts/:contractId/sign', verifyJWT, async (req, res, next) => {
+  try {
+    const roles = req.user?.realm_access?.roles || [];
+    if (!roles.includes('data-provider')) {
+      return res.status(403).json({ status: 'FAILED', error: 'INSUFFICIENT_ROLE' });
+    }
+    const { notificationId, contractHash, signature } = req.body || {};
+    if (!contractHash || !signature) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_SIGNATURE' });
+    }
+    const providerId = callerProviderId(req);
+    let result;
+    try {
+      result = await submitTeeContractSignature({
+        contractId: req.params.contractId,
+        providerUsername: req.user?.preferred_username,
+        notificationId,
+        contractHash,
+        signature,
+      });
+    } catch (err) {
+      if (err.statusCode) {
+        return res.status(err.statusCode).json(err.data || { status: 'FAILED', error: err.message });
+      }
+      throw err;
+    }
+
+    await logAuditEvent('TEE_CONTRACT_SIGNED', req.user.sub, {
+      contractId: req.params.contractId,
+      providerId,
+      contractHash,
+      timestamp: new Date().toISOString(),
+    });
+    console.log('[P3DX_STEP_OK] tee-contracts/sign:', { providerId, contractId: req.params.contractId, allSigned: result?.all_signed });
     return res.json(result);
   } catch (err) {
     next(err);

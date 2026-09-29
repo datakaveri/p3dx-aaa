@@ -150,12 +150,15 @@ export async function generateContractFromGovLayer({ token, datasets, applicatio
 // (see that file's comments), so demo placeholders are fine here. Both the
 // TEE and SMPC catalogue entry points call startTeeSession and get this same
 // skald-anonymizer image — there's no separate SMPC workload image yet.
-function buildTeeContract({ datasetUrl, datasetId, datasetName, consumerId }) {
+function buildTeeContract({ datasetUrl, datasetId, datasetName, consumerId, governanceContractId }) {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + 30 * 60 * 1000); // 30-minute run window
   return {
     contractId: uuidv4(),
     requestId: uuidv4(),
+    // The generated contract every data provider must have signed —
+    // gov_layer refuses to provision a TEE without it (tee_contract_signing.go).
+    governanceContractId,
     consumerId: consumerId || 'demo-consumer',
     providerId: 'demo-provider',
     appDetails: {
@@ -192,8 +195,8 @@ function orchestratorErrorMessage(resp) {
 // POST /v1/tee/sessions in p3dx_gov_layer/internal/httpapi/tee_session.go)
 // and returns immediately with a session id to poll; provisioning alone can
 // take minutes (cold confidential-VM boot).
-export async function startTeeSession({ datasetUrl, datasetId, datasetName, consumerId }) {
-  const contract = buildTeeContract({ datasetUrl, datasetId, datasetName, consumerId });
+export async function startTeeSession({ datasetUrl, datasetId, datasetName, consumerId, governanceContractId }) {
+  const contract = buildTeeContract({ datasetUrl, datasetId, datasetName, consumerId, governanceContractId });
   const url = buildOrchestratorUrl('/v1/tee/sessions');
 
   const resp = await axios.post(url, contract, {
@@ -327,6 +330,45 @@ export async function markParticipationNotificationRead({ notificationId, userna
   );
   if (resp.status < 200 || resp.status >= 300) {
     throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data;
+}
+
+// POST /tee-contracts/{contractId}/sign — a data provider's RSA signature
+// over a generated TEE contract's hash. gov_layer re-hashes its stored copy
+// and verifies the signature with the public key Keycloak holds for
+// providerUsername (see p3dx_gov_layer/internal/httpapi/tee_contract_signing.go).
+export async function submitTeeContractSignature({ contractId, providerUsername, notificationId, contractHash, signature }) {
+  const url = buildTopUrl(`/tee-contracts/${encodeURIComponent(contractId)}/sign`);
+  const resp = await axios.post(
+    url,
+    {
+      provider_username: providerUsername,
+      notification_id: notificationId,
+      contract_hash: contractHash,
+      signature,
+    },
+    { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(govLayerErrorMessage(resp));
+    err.statusCode = resp.status;
+    err.data = resp.data;
+    throw err;
+  }
+  return resp.data;
+}
+
+// GET /tee-contracts/{contractId}/signatures — each data provider's signing
+// state on a generated TEE contract, re-verified by gov_layer against Keycloak.
+export async function getTeeContractSignatures({ contractId }) {
+  const url = buildTopUrl(`/tee-contracts/${encodeURIComponent(contractId)}/signatures`);
+  const resp = await axios.get(url, { timeout: 15000, validateStatus: () => true });
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(govLayerErrorMessage(resp));
+    err.statusCode = resp.status;
+    err.data = resp.data;
+    throw err;
   }
   return resp.data;
 }
