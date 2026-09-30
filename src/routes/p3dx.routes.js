@@ -42,8 +42,9 @@ import {
   getSentNotifications,
   markParticipationNotificationRead,
   respondToParticipationNotification,
-  submitTeeContractSignature,
-  getTeeContractSignatures,
+  submitContractSignature,
+  getContractSignatures,
+  getSessionContractSignatures,
   buildSessionContract,
   getSessionContract,
   getContractByProject,
@@ -515,12 +516,12 @@ router.post('/workloads/tee-sessions', verifyJWT, requireRole('user'), async (re
   }
 });
 
-// GET /workloads/tee-contracts/:contractId/signatures — lets the consumer who
-// generated a TEE contract see which data providers have signed it. A TEE
-// can't run (POST /workloads/tee-sessions) until all_signed is true.
-router.get('/workloads/tee-contracts/:contractId/signatures', verifyJWT, requireRole('user'), async (req, res, next) => {
+// GET /workloads/contracts/:contractId/signatures — lets the consumer who
+// generated a TEE/SMPC contract see which data providers have signed it. The
+// run (POST /workloads/tee-sessions) can't start until all_signed is true.
+router.get('/workloads/contracts/:contractId/signatures', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {
-    const result = await getTeeContractSignatures({ contractId: req.params.contractId });
+    const result = await getContractSignatures({ contractId: req.params.contractId });
     return res.json(result);
   } catch (err) {
     if (err.statusCode) {
@@ -1371,6 +1372,53 @@ router.post('/notify-roster', verifyJWT, async (req, res, next) => {
   }
 });
 
+// FL sessions only start once every data provider on the session's final
+// roster contract has signed its hash (gov_layer's contract signing — the
+// same gate TEE/SMPC runs have). Returns null when the session may start,
+// else the { code, body } to reject with.
+async function flContractSignatureBlock(submissionId) {
+  let status;
+  try {
+    status = await getSessionContractSignatures({ sessionId: submissionId });
+  } catch (err) {
+    if (err.statusCode === 404) {
+      return {
+        code: 403,
+        body: { status: 'FAILED', error: 'CONTRACT_NOT_SIGNED', message: 'No final roster contract for this session yet.' },
+      };
+    }
+    throw err;
+  }
+  if (status?.all_signed) return null;
+  const pending = (status?.parties || []).filter(p => !p.valid).map(p => p.provider_id);
+  return {
+    code: 403,
+    body: {
+      status: 'FAILED',
+      error: 'CONTRACT_NOT_SIGNED',
+      message: status?.signable === false
+        ? 'The final roster contract has not been sent yet.'
+        : `Waiting on data-provider signatures: ${pending.join(', ') || 'none recorded'}`,
+      signatures: status,
+    },
+  };
+}
+
+// GET /contracts/by-session/:sessionId/signatures — signing status of a
+// session's current contract, so the FL owner's page can show who has signed
+// and only enable "Start FL Session" once everyone has.
+router.get('/contracts/by-session/:sessionId/signatures', verifyJWT, async (req, res, next) => {
+  try {
+    const result = await getSessionContractSignatures({ sessionId: req.params.sessionId });
+    return res.json(result);
+  } catch (err) {
+    if (err.statusCode) {
+      return res.status(err.statusCode).json(err.data || { status: 'FAILED', error: err.message });
+    }
+    next(err);
+  }
+});
+
 // Shared by /gov/queue-fl-session and /gov/restart-fl-session: notifies the
 // fl-orchestrator operator account of a pending FL session start
 // (payload.kind: 'fl_session_pending') - see p3dx-auth-ui's
@@ -1416,6 +1464,11 @@ router.post('/gov/queue-fl-session', verifyJWT, async (req, res, next) => {
       return res.status(400).json({ status: 'FAILED', error: 'MISSING_PARTICIPATING_PROVIDERS' });
     }
 
+    const blocked = await flContractSignatureBlock(submission_id);
+    if (blocked) {
+      return res.status(blocked.code).json(blocked.body);
+    }
+
     const outputOwnerUsername = req.user?.preferred_username;
     const adminToken = await getAdminToken();
 
@@ -1446,6 +1499,9 @@ router.post('/gov/queue-fl-session', verifyJWT, async (req, res, next) => {
 // (restart: true) so the restart gets its own project_id/contract_id instead
 // of overwriting the previous project's row - each restart is its own project
 // with its own contract, even though it reuses the same session/parties.
+// That new contract has a new hash, so gov_layer sends every provider a fresh
+// sign request; the session is only queued for the fl-orchestrator once they
+// have all signed, via POST /gov/restart-fl-session/queue below.
 router.post('/gov/restart-fl-session', verifyJWT, async (req, res, next) => {
   try {
     const { submission_id, provider_usernames } = req.body || {};
@@ -1513,7 +1569,7 @@ router.post('/gov/restart-fl-session', verifyJWT, async (req, res, next) => {
     await sendParticipationNotifications({
       recipients: providers.map(p => ({ id: p.id, username: p.username })),
       senderUsername: outputOwnerUsername,
-      message: `${outputOwnerUsername} is using the same contract and starting the FL session for submission ${submission_id} again.`,
+      message: `${outputOwnerUsername} is starting the FL session for submission ${submission_id} again with the same roster — please sign the new contract.`,
       payload: {
         kind: 'fl_session_restart',
         submission_id,
@@ -1521,9 +1577,51 @@ router.post('/gov/restart-fl-session', verifyJWT, async (req, res, next) => {
       },
     });
 
-    // From here it's the exact same path as a first-time "Start FL Session":
-    // queue to the fl-orchestrator, who signs in with Azure and provisions
-    // the VM, then calls start-fl-session to notify providers to join.
+    console.log('[P3DX_STEP_OK] restart-fl-session: new contract sent for signing', {
+      owner: outputOwnerUsername, submission_id,
+    });
+
+    return res.status(200).json({ status: 'SUCCESS', awaiting_signatures: !contractError, contract_error: contractError });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /gov/restart-fl-session/queue — second half of "Start Again": once
+// every provider has signed the restart's new contract, queue it for the
+// fl-orchestrator exactly like a first-time "Start FL Session" (who signs in
+// with Azure and provisions the VM, then calls start-fl-session).
+router.post('/gov/restart-fl-session/queue', verifyJWT, async (req, res, next) => {
+  try {
+    const { submission_id, provider_usernames } = req.body || {};
+    if (!submission_id) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_SUBMISSION_ID' });
+    }
+    const usernames = Array.isArray(provider_usernames) ? provider_usernames.filter(Boolean) : [];
+    if (usernames.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'MISSING_PARTICIPATING_PROVIDERS' });
+    }
+
+    const blocked = await flContractSignatureBlock(submission_id);
+    if (blocked) {
+      return res.status(blocked.code).json(blocked.body);
+    }
+
+    const adminToken = await getAdminToken();
+    const providers = [];
+    for (const username of usernames) {
+      try {
+        const id = await getUserId(username, adminToken);
+        providers.push({ id, username });
+      } catch (err) {
+        console.warn('[P3DX_STEP_WARN] restart-fl-session/queue: provider lookup failed:', username, err.message || err);
+      }
+    }
+    if (providers.length === 0) {
+      return res.status(400).json({ status: 'FAILED', error: 'PROVIDERS_NOT_FOUND' });
+    }
+
+    const outputOwnerUsername = req.user?.preferred_username;
     await queueFlSessionForOrchestrator({
       submissionId: submission_id,
       providers,
@@ -1532,11 +1630,11 @@ router.post('/gov/restart-fl-session', verifyJWT, async (req, res, next) => {
       adminToken,
     });
 
-    console.log('[P3DX_STEP_OK] restart-fl-session: notified providers and re-queued for fl-orchestrator', {
+    console.log('[P3DX_STEP_OK] restart-fl-session/queue: re-queued for fl-orchestrator', {
       owner: outputOwnerUsername, submission_id,
     });
 
-    return res.status(200).json({ status: 'SUCCESS', contract_error: contractError });
+    return res.status(200).json({ status: 'SUCCESS' });
   } catch (err) {
     next(err);
   }
@@ -1566,6 +1664,11 @@ router.post('/gov/start-fl-session', verifyJWT, async (req, res, next) => {
       .map(p => ({ id: p.id, username: p.username }));
     if (recipients.length === 0) {
       return res.status(400).json({ status: 'FAILED', error: 'MISSING_PARTICIPATING_PROVIDERS' });
+    }
+
+    const blocked = await flContractSignatureBlock(submission_id);
+    if (blocked) {
+      return res.status(blocked.code).json(blocked.body);
     }
 
     const senderUsername = output_owner_username || req.user?.preferred_username;
@@ -1808,38 +1911,40 @@ router.post('/notifications/:id/respond', verifyJWT, async (req, res, next) => {
   }
 });
 
-// --- TEE contract signing -------------------------------------------------
-// When a consumer generates a TEE contract, gov_layer hashes it and sends
-// the hash + contract to each participating data provider as a
-// TEE_CONTRACT_SIGN notification addressed to their provider_id
-// ("provider-<slug(username)>", the same id their APD dataset policies carry).
-// The provider signs the hash in the browser with the private key they
-// generated locally; the platform never holds or receives that private key.
+// --- Contract signing (FL, TEE, SMPC) -------------------------------------
+// gov_layer hashes each contract (FL: the final roster contract; TEE/SMPC:
+// the generated contract), signs the hash with its own private key, and
+// sends hash + governance signature + governance public key + contract to
+// each participating data provider as a CONTRACT_SIGN notification addressed
+// to their provider_id ("provider-<slug(username)>", the same id their APD
+// dataset policies carry). The provider verifies the governance signature,
+// then signs the hash in the browser with the private key they generated
+// locally; the platform never holds or receives that private key.
 
 function callerProviderId(req) {
   return `provider-${slugify(req.user?.preferred_username || req.user?.email)}`;
 }
 
-// GET /tee-contracts/sign-requests — the caller's TEE contract sign requests.
-router.get('/tee-contracts/sign-requests', verifyJWT, async (req, res, next) => {
+// GET /contracts/sign-requests — the caller's contract sign requests.
+router.get('/contracts/sign-requests', verifyJWT, async (req, res, next) => {
   try {
     const roles = req.user?.realm_access?.roles || [];
     if (!roles.includes('data-provider')) {
       return res.status(403).json({ status: 'FAILED', error: 'INSUFFICIENT_ROLE' });
     }
     const notifications = await getRecipientNotifications({ username: callerProviderId(req) });
-    const requests = notifications.filter(n => n?.payload?.type === 'TEE_CONTRACT_SIGN');
+    const requests = notifications.filter(n => n?.payload?.type === 'CONTRACT_SIGN');
     return res.json({ status: 'SUCCESS', requests });
   } catch (err) {
     next(err);
   }
 });
 
-// POST /tee-contracts/:contractId/sign — body { notificationId, contractHash,
+// POST /contracts/:contractId/sign — body { notificationId, contractHash,
 // signature (base64) }. Forwards the caller's verified Keycloak username;
 // gov_layer maps it to their provider_id and verifies the signature with the
 // public key Keycloak holds for them, against its own copy of the hash.
-router.post('/tee-contracts/:contractId/sign', verifyJWT, async (req, res, next) => {
+router.post('/contracts/:contractId/sign', verifyJWT, async (req, res, next) => {
   try {
     const roles = req.user?.realm_access?.roles || [];
     if (!roles.includes('data-provider')) {
@@ -1852,7 +1957,7 @@ router.post('/tee-contracts/:contractId/sign', verifyJWT, async (req, res, next)
     const providerId = callerProviderId(req);
     let result;
     try {
-      result = await submitTeeContractSignature({
+      result = await submitContractSignature({
         contractId: req.params.contractId,
         providerUsername: req.user?.preferred_username,
         notificationId,
@@ -1866,13 +1971,13 @@ router.post('/tee-contracts/:contractId/sign', verifyJWT, async (req, res, next)
       throw err;
     }
 
-    await logAuditEvent('TEE_CONTRACT_SIGNED', req.user.sub, {
+    await logAuditEvent('CONTRACT_SIGNED', req.user.sub, {
       contractId: req.params.contractId,
       providerId,
       contractHash,
       timestamp: new Date().toISOString(),
     });
-    console.log('[P3DX_STEP_OK] tee-contracts/sign:', { providerId, contractId: req.params.contractId, allSigned: result?.all_signed });
+    console.log('[P3DX_STEP_OK] contracts/sign:', { providerId, contractId: req.params.contractId, allSigned: result?.all_signed });
     return res.json(result);
   } catch (err) {
     next(err);
