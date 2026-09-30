@@ -334,12 +334,12 @@ export async function markParticipationNotificationRead({ notificationId, userna
   return resp.data;
 }
 
-// POST /tee-contracts/{contractId}/sign — a data provider's RSA signature
-// over a generated TEE contract's hash. gov_layer re-hashes its stored copy
-// and verifies the signature with the public key Keycloak holds for
-// providerUsername (see p3dx_gov_layer/internal/httpapi/tee_contract_signing.go).
-export async function submitTeeContractSignature({ contractId, providerUsername, notificationId, contractHash, signature }) {
-  const url = buildTopUrl(`/tee-contracts/${encodeURIComponent(contractId)}/sign`);
+// POST /contracts/{contractId}/sign — a data provider's RSA signature over a
+// contract's hash (FL final roster, TEE or SMPC). gov_layer re-hashes its
+// stored copy and verifies the signature with the public key Keycloak holds
+// for providerUsername (see p3dx_gov_layer/internal/httpapi/contract_signing.go).
+export async function submitContractSignature({ contractId, providerUsername, notificationId, contractHash, signature }) {
+  const url = buildTopUrl(`/contracts/${encodeURIComponent(contractId)}/sign`);
   const resp = await axios.post(
     url,
     {
@@ -359,10 +359,24 @@ export async function submitTeeContractSignature({ contractId, providerUsername,
   return resp.data;
 }
 
-// GET /tee-contracts/{contractId}/signatures — each data provider's signing
-// state on a generated TEE contract, re-verified by gov_layer against Keycloak.
-export async function getTeeContractSignatures({ contractId }) {
-  const url = buildTopUrl(`/tee-contracts/${encodeURIComponent(contractId)}/signatures`);
+// GET /contracts/{contractId}/signatures — each data provider's signing
+// state on a contract, re-verified by gov_layer against Keycloak.
+export async function getContractSignatures({ contractId }) {
+  const url = buildTopUrl(`/contracts/${encodeURIComponent(contractId)}/signatures`);
+  const resp = await axios.get(url, { timeout: 15000, validateStatus: () => true });
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(govLayerErrorMessage(resp));
+    err.statusCode = resp.status;
+    err.data = resp.data;
+    throw err;
+  }
+  return resp.data;
+}
+
+// GET /contracts/by-session/{sessionId}/signatures — the same status for a
+// session's current contract (for FL, the final roster contract once built).
+export async function getSessionContractSignatures({ sessionId }) {
+  const url = buildTopUrl(`/contracts/by-session/${encodeURIComponent(sessionId)}/signatures`);
   const resp = await axios.get(url, { timeout: 15000, validateStatus: () => true });
   if (resp.status < 200 || resp.status >= 300) {
     const err = new Error(govLayerErrorMessage(resp));
