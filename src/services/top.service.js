@@ -136,7 +136,10 @@ export async function generateContractFromGovLayer({ token, datasets, applicatio
   );
 
   if (resp.status < 200 || resp.status >= 300) {
-    throw new Error(govLayerErrorMessage(resp));
+    const err = new Error(govLayerErrorMessage(resp));
+    err.statusCode = resp.status;
+    err.data = resp.data;
+    throw err;
   }
 
   return resp.data?.contract;
@@ -338,7 +341,8 @@ export async function markParticipationNotificationRead({ notificationId, userna
 // contract's hash (FL final roster, TEE or SMPC). gov_layer re-hashes its
 // stored copy and verifies the signature with the public key Keycloak holds
 // for providerUsername (see p3dx_gov_layer/internal/httpapi/contract_signing.go).
-export async function submitContractSignature({ contractId, providerUsername, notificationId, contractHash, signature }) {
+// accessToken is the provider's own token — gov_layer takes the signer from it.
+export async function submitContractSignature({ contractId, providerUsername, notificationId, contractHash, signature, accessToken }) {
   const url = buildTopUrl(`/contracts/${encodeURIComponent(contractId)}/sign`);
   const resp = await axios.post(
     url,
@@ -348,7 +352,11 @@ export async function submitContractSignature({ contractId, providerUsername, no
       contract_hash: contractHash,
       signature,
     },
-    { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
+    {
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+      timeout: 10000,
+      validateStatus: () => true,
+    }
   );
   if (resp.status < 200 || resp.status >= 300) {
     const err = new Error(govLayerErrorMessage(resp));
