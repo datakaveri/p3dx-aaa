@@ -466,6 +466,11 @@ router.post('/workloads/preview-contract', verifyJWT, requireRole('user'), async
 
     return res.status(200).json({ status: 'SUCCESS', contract });
   } catch (err) {
+    // Surface gov_layer's own status/message (e.g. 401 "Invalid Keycloak
+    // token") instead of errorMiddleware's generic INTERNAL_ERROR.
+    if (err.statusCode) {
+      return res.status(err.statusCode).json({ status: 'FAILED', error: err.message });
+    }
     next(err);
   }
 });
@@ -517,8 +522,8 @@ router.post('/workloads/tee-sessions', verifyJWT, requireRole('user'), async (re
 });
 
 // GET /workloads/contracts/:contractId/signatures — lets the consumer who
-// generated a TEE/SMPC contract see which data providers have signed it. The
-// run (POST /workloads/tee-sessions) can't start until all_signed is true.
+// generated a TEE/SMPC contract see whether its signatures match. The run
+// (POST /workloads/tee-sessions) can't start until tee is "can run".
 router.get('/workloads/contracts/:contractId/signatures', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {
     const result = await getContractSignatures({ contractId: req.params.contractId });
@@ -1167,7 +1172,8 @@ router.post(
 
 // Whether the caller has a public key registered. The key pair is per-user
 // (shared across KEY_PAIR_ROLES), so the lookup is per-user — the :roleName
-// segment only gates on the caller actually holding that role. Lets the UI
+// segment only gates on the caller actually holding that role (gov_layer
+// re-checks it on the forwarded token). Lets the UI
 // choose between "Generate Key Pair" and "Regenerate Key Pair".
 router.get('/keys/:roleName/status', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {
@@ -1176,7 +1182,10 @@ router.get('/keys/:roleName/status', verifyJWT, requireRole('user'), async (req,
       return res.status(400).json({ status: 'FAILED', error: 'ROLE_NOT_ALLOWED' });
     }
 
-    const { exists } = await getPublicKeyStatus({ userId: req.user.sub });
+    const { exists } = await getPublicKeyStatus({
+      roleName,
+      accessToken: req.headers.authorization.split(' ')[1],
+    });
     return res.json({ status: 'SUCCESS', exists });
   } catch (err) {
     next(err);
@@ -1186,7 +1195,9 @@ router.get('/keys/:roleName/status', verifyJWT, requireRole('user'), async (req,
 // Register (or replace) the caller's public key. The key pair is generated
 // in the provider's browser and the private key is saved straight to their
 // disk — only the SPKI public key PEM arrives here, and it is stored solely
-// in Keycloak's "public_key" attribute. The platform never holds a private key.
+// in gov_layer's Postgres (provider_public_keys), with the caller's token
+// forwarded so gov_layer knows whose key it is. The platform never holds a
+// private key.
 router.post('/keys/:roleName/public-key', verifyJWT, requireRole('user'), async (req, res, next) => {
   try {
     const roleName = req.params.roleName;
@@ -1203,6 +1214,7 @@ router.post('/keys/:roleName/public-key', verifyJWT, requireRole('user'), async 
       userId: req.user.sub,
       roleName,
       publicKeyPem: req.body?.publicKeyPem,
+      accessToken: req.headers.authorization.split(' ')[1],
     });
     return res.json({ status: 'SUCCESS', fingerprint_sha256: fingerprint });
   } catch (err) {
@@ -1389,16 +1401,13 @@ async function flContractSignatureBlock(submissionId) {
     }
     throw err;
   }
-  if (status?.all_signed) return null;
-  const pending = (status?.parties || []).filter(p => !p.valid).map(p => p.provider_id);
+  if (status?.tee === 'can run') return null;
   return {
     code: 403,
     body: {
       status: 'FAILED',
       error: 'CONTRACT_NOT_SIGNED',
-      message: status?.signable === false
-        ? 'The final roster contract has not been sent yet.'
-        : `Waiting on data-provider signatures: ${pending.join(', ') || 'none recorded'}`,
+      message: 'Data-provider signatures are not matching yet — every data provider must sign the final roster contract.',
       signatures: status,
     },
   };
@@ -1963,6 +1972,7 @@ router.post('/contracts/:contractId/sign', verifyJWT, async (req, res, next) => 
         notificationId,
         contractHash,
         signature,
+        accessToken: req.headers.authorization.split(' ')[1],
       });
     } catch (err) {
       if (err.statusCode) {
@@ -1977,7 +1987,7 @@ router.post('/contracts/:contractId/sign', verifyJWT, async (req, res, next) => 
       contractHash,
       timestamp: new Date().toISOString(),
     });
-    console.log('[P3DX_STEP_OK] contracts/sign:', { providerId, contractId: req.params.contractId, allSigned: result?.all_signed });
+    console.log('[P3DX_STEP_OK] contracts/sign:', { providerId, contractId: req.params.contractId, signed: result?.status });
     return res.json(result);
   } catch (err) {
     next(err);
