@@ -12,6 +12,7 @@
     "test:maa": "node test-maa-tokens.js",
     "test:audit": "node verify-audit.js",
     "test:immudb": "node test-immudb-audit.js",
+    "test:flvm": "node --test test/flvm/",
     "setup:immudb": "node setup-immudb.mjs",
     "diagnose:immudb": "node diagnose-immudb.mjs"
   },
