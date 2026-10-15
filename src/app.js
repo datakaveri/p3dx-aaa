@@ -22,7 +22,7 @@ app.use(
       if (corsOrigins.includes(origin)) return callback(null, true);
       return callback(new Error("CORS: origin not allowed"));
     },
-    methods: ["GET", "POST", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
