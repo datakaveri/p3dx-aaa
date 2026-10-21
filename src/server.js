@@ -1,12 +1,14 @@
 import 'dotenv/config';
 import app from './app.js';
 import { initImmuDB } from './services/immudb.service.js';
+import { startFlVmSweeper } from './services/flVmSweeper.service.js';
 
 const PORT = process.env.PORT || 3000;
 
 async function start() {
   try {
     await initImmuDB();
+    startFlVmSweeper();
 
     app.listen(PORT, () => {
       console.log(`p3dx-aaa auth backend running on port ${PORT}`);
