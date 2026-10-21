@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import p3dxRoutes from "./routes/p3dx.routes.js";
 import formSubmissionsRoutes from "./routes/formSubmissions.routes.js";
+import flVmRoutes from "./routes/flVm.routes.js";
 import errorMiddleware from "./middlewares/error.middleware.js";
 
 const app = express();
@@ -26,6 +27,11 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
+// Flotilla FL VM credential routes go BEFORE the app-wide body parsers: they
+// carry passwords / offline tokens and parse their own bodies, so a malformed
+// request is rejected without its raw body reaching the error middleware log.
+app.use("/p3dx", flVmRoutes);
 
 app.use(express.json({ limit: "5mb" }));
 app.use(express.text({ type: ['text/*', 'application/jwt'] }));

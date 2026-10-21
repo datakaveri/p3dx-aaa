@@ -28,6 +28,10 @@ function getJWKS() {
   return jwks;
 }
 
+function flotillaVmClientId() {
+  return String(process.env.FLOTILLA_VM_CLIENT_ID || 'flotilla-vm').trim();
+}
+
 export async function verifyJWT(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
@@ -54,6 +58,23 @@ export async function verifyJWT(req, res, next) {
       // issuer removed intentionally
     });
 
+    // Containment: tokens minted for the Flotilla FL client VMs (client
+    // flotilla-vm, offline-token backed) are only good at the join gateway
+    // (/p3dx/fl/vm-token, which doesn't use verifyJWT) — never as a user
+    // session against the rest of the API.
+    if (payload.azp && payload.azp === flotillaVmClientId()) {
+      await logAuditEvent('JWT_VERIFY_FAILED', payload.preferred_username || payload.sub || 'unknown', {
+        reason: 'VM_TOKEN_NOT_ALLOWED',
+        ip: req.ip,
+        endpoint: req.path,
+        timestamp: new Date().toISOString(),
+      });
+      return res.status(403).json({
+        status: "FAILED",
+        error: "VM_TOKEN_NOT_ALLOWED",
+      });
+    }
+
     req.user = payload;
     next();
   } catch (err) {
@@ -76,4 +97,52 @@ export async function verifyJWT(req, res, next) {
         : { detail: err?.message || String(err) }),
     });
   }
+}
+
+/**
+ * Service-to-service auth for internal callbacks: a Keycloak client-
+ * credentials token (same realm JWKS as verifyJWT) whose azp is `clientId`
+ * and whose realm roles include `role`. clientId may be a function so the
+ * env var is read at request time.
+ */
+export function verifyServiceToken(clientId, role) {
+  return async (req, res, next) => {
+    const expectedClient = typeof clientId === 'function' ? clientId() : clientId;
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader?.startsWith("Bearer ")) {
+      return res.status(401).json({
+        status: "FAILED",
+        error: "MISSING_AUTH_TOKEN",
+      });
+    }
+
+    let payload;
+    try {
+      ({ payload } = await jwtVerify(authHeader.split(" ")[1], getJWKS()));
+    } catch (err) {
+      console.error("SERVICE JWT VERIFY ERROR:", err.message);
+      return res.status(401).json({
+        status: "FAILED",
+        error: "INVALID_OR_EXPIRED_TOKEN",
+      });
+    }
+
+    const roles = payload?.realm_access?.roles || [];
+    if (!expectedClient || payload.azp !== expectedClient || !roles.includes(role)) {
+      await logAuditEvent('SERVICE_TOKEN_REJECTED', payload?.azp || 'unknown', {
+        expected_client: expectedClient,
+        required_role: role,
+        endpoint: req.path,
+        timestamp: new Date().toISOString(),
+      });
+      return res.status(403).json({
+        status: "FAILED",
+        error: "SERVICE_NOT_ALLOWED",
+      });
+    }
+
+    req.service = payload;
+    next();
+  };
 }

@@ -7,16 +7,16 @@ const ImmudbClient = pkg.default;
 let client;
 let initializationComplete = false;
 
-async function scanAllByPrefix(prefix) {
+async function scanAllByPrefix(prefix, c = client) {
   const results = [];
   let seekkey;
 
   for (;;) {
-    const page = await client.scan({
+    const page = mustRespond(await c.scan({
       prefix,
       seekkey,
       limit: 1000,
-    });
+    }));
 
     const entries = page?.entriesList || [];
     if (entries.length === 0) {
@@ -36,59 +36,182 @@ async function scanAllByPrefix(prefix) {
   return results;
 }
 
-export async function initImmuDB() {
+function readImmuDBEnv() {
   const host = process.env.IMMUDB_HOST;
   const portRaw = process.env.IMMUDB_PORT;
   const user = process.env.IMMUDB_USER;
   const password = process.env.IMMUDB_PASSWORD;
   const database = process.env.IMMUDB_DATABASE;
-
   const port = Number.parseInt(portRaw, 10);
-  if (!host || !portRaw || Number.isNaN(port) || !user || !password) {
+  const configured = !!(host && portRaw && !Number.isNaN(port) && user && password);
+  return { host, port, user, password, database, configured };
+}
+
+// Builds a fresh, logged-in client with the database selected. Throws on any
+// failure (callers decide whether that's fatal).
+async function connectClient({ host, port, user, password, database }) {
+  const next = new ImmudbClient({ host, port });
+  await next.login({ user, password });
+  await next.useDatabase({ databasename: database });
+  return next;
+}
+
+function closeClientQuietly(old) {
+  try {
+    old?.client?.close?.();
+  } catch {
+    // ignore — the channel is being replaced anyway
+  }
+}
+
+export async function initImmuDB() {
+  const cfg = readImmuDBEnv();
+
+  if (!cfg.configured) {
     client = null;
     console.warn('⚠ immuDB env not fully configured. Audit logging will be console-only.');
     initializationComplete = true;
     return;
   }
 
+  if (!cfg.database) {
+    console.warn('⚠ IMMUDB_DATABASE not set. Audit logging will be console-only.');
+    client = null;
+    initializationComplete = true;
+    return;
+  }
+
   try {
-    client = new ImmudbClient({
-      host,
-      port,
-    });
-
-    await client.login({
-      user,
-      password,
-    });
-
-    if (database) {
-      try {
-        await client.useDatabase({
-          databasename: database,
-        });
-        console.log('✓ immuDB connected and database selected');
-      } catch (err) {
-        if (err.message?.includes('NOT_FOUND') || err.message?.includes('does not exist')) {
-          console.warn('⚠ immuDB database not found. Audit logging will be console-only.');
-          console.warn(`  Database: ${database}`);
-          console.warn('  To enable immuDB audit logging, create the database first.');
-          client = null;
-        } else {
-          throw err;
-        }
-      }
-    } else {
-      console.warn('⚠ IMMUDB_DATABASE not set. Audit logging will be console-only.');
-      client = null;
-    }
+    client = await connectClient(cfg);
+    console.log('✓ immuDB connected and database selected');
   } catch (err) {
     client = null;
-    console.warn('⚠ immuDB connection/login failed. Audit logging will be console-only.');
-    console.warn(`  ${err.message}`);
+    const msg = errorText(err);
+    if (msg.includes('NOT_FOUND') || msg.includes('does not exist')) {
+      console.warn('⚠ immuDB database not found. Audit logging will be console-only.');
+      console.warn(`  Database: ${cfg.database}`);
+      console.warn('  To enable immuDB audit logging, create the database first.');
+    } else {
+      console.warn('⚠ immuDB connection/login failed. Audit logging will be console-only.');
+      console.warn(`  ${msg}`);
+    }
   }
 
   initializationComplete = true;
+}
+
+// immudb-node rejects with an Error on most calls but with a bare string on
+// get() — normalise both.
+function errorText(err) {
+  if (typeof err === 'string') return err;
+  return String(err?.message || err?.details || err || '');
+}
+
+// gRPC UNAVAILABLE (14) / UNAUTHENTICATED (16), or an immudb session/token
+// that no longer exists after an immudb restart. The original client never
+// recovered from these; withImmuReconnect() below re-inits once and retries.
+function isConnectionError(err) {
+  const code = typeof err === 'object' && err ? err.code : undefined;
+  if (code === 14 || code === 16) return true;
+  const msg = errorText(err);
+  return /^1[46] |UNAVAILABLE|UNAUTHENTICATED|ECONNRESET|ECONNREFUSED|EPIPE|Connection dropped|connection closed|Channel has been shut down|session not found|invalid token|not logged in|no session|please login/i.test(msg);
+}
+
+export function isKeyNotFoundError(err) {
+  return /key not found/i.test(errorText(err));
+}
+
+let reconnecting = null;
+
+// Single-flight re-init: concurrent callers that all hit a stale connection
+// share one reconnect attempt. Returns the new client or null.
+export async function reconnectImmuDB() {
+  if (reconnecting) return reconnecting;
+  reconnecting = (async () => {
+    const cfg = readImmuDBEnv();
+    if (!cfg.configured || !cfg.database) return null;
+    try {
+      const next = await connectClient(cfg);
+      const old = client;
+      client = next;
+      if (old && old !== next) closeClientQuietly(old);
+      console.log('✓ immuDB reconnected');
+      return client;
+    } catch (err) {
+      console.error(`✗ immuDB reconnect failed: ${errorText(err)}`);
+      return null;
+    }
+  })();
+  try {
+    return await reconnecting;
+  } finally {
+    reconnecting = null;
+  }
+}
+
+// Runs fn(client). With no client (immudb was down at startup) or on a
+// connection-class error, re-inits the client once and retries. Anything
+// else — or a second failure — is thrown to the caller.
+async function withImmuReconnect(fn) {
+  let c = client;
+  if (!c) {
+    c = await reconnectImmuDB();
+    if (!c) {
+      throw new Error('IMMUDB_UNAVAILABLE');
+    }
+    return fn(c);
+  }
+  try {
+    return await fn(c);
+  } catch (err) {
+    if (!isConnectionError(err)) throw err;
+    const fresh = await reconnectImmuDB();
+    if (!fresh) {
+      throw new Error(`IMMUDB_UNAVAILABLE: ${errorText(err)}`);
+    }
+    return fn(fresh);
+  }
+}
+
+/**
+ * Generic KV helpers with reconnect-on-error. Unlike the audit helpers below
+ * these never swallow errors: a caller that must fail closed (e.g. the FL VM
+ * credential records) gets a throw when immuDB is unavailable.
+ */
+export async function kvSet(key, value) {
+  await withImmuReconnect(async c => mustRespond(await c.set({ key, value })));
+}
+
+// Returns the latest value for key as a string, or null if the key doesn't
+// exist. Throws on any other error.
+export async function kvGet(key) {
+  try {
+    const resp = await withImmuReconnect(async c => mustRespond(await c.get({ key })));
+    const value = resp?.value ?? null;
+    if (value === null || value === undefined) return null;
+    return Buffer.isBuffer(value) ? value.toString('utf8') : String(value);
+  } catch (err) {
+    if (isKeyNotFoundError(err)) return null;
+    throw err instanceof Error ? err : new Error(errorText(err));
+  }
+}
+
+// All {key, value} entries whose key starts with prefix (latest values).
+// immudb-node catches synchronous failures (e.g. a closed gRPC channel),
+// console.errors them and resolves undefined instead of rejecting. A real
+// response is always an object, so treat undefined as a connection failure —
+// otherwise a dead client would read as "key not found" (fail open).
+function mustRespond(resp) {
+  if (resp === undefined || resp === null) {
+    const err = new Error('IMMUDB_NO_RESPONSE');
+    err.code = 14;
+    throw err;
+  }
+  return resp;
+}
+
+export async function kvScan(prefix) {
+  return withImmuReconnect(c => scanAllByPrefix(prefix, c));
 }
 
 export function isImmuDBInitialized() {
@@ -125,16 +248,16 @@ export async function logAuditEvent(eventType, subjectId, metadata = {}) {
     const eventJson = JSON.stringify(event);
     
     // Store with event_id as primary key
-    await client.set({ key: `audit:${eventId}`, value: eventJson });
+    await kvSet(`audit:${eventId}`, eventJson);
     
     // Store with event_type index for filtering
-    await client.set({ key: `audit:type:${eventType}:${eventId}`, value: eventJson });
+    await kvSet(`audit:type:${eventType}:${eventId}`, eventJson);
     
     // Store with subject_id index for user tracking
-    await client.set({ key: `audit:subject:${subjectId}:${eventId}`, value: eventJson });
+    await kvSet(`audit:subject:${subjectId}:${eventId}`, eventJson);
     
     // Store with timestamp for chronological querying
-    await client.set({ key: `audit:time:${timestamp}:${eventId}`, value: eventJson });
+    await kvSet(`audit:time:${timestamp}:${eventId}`, eventJson);
 
     console.log(`✓ ImmuDB audit logged [${eventType}] for ${subjectId} (ID: ${eventId})`);
     return event;
