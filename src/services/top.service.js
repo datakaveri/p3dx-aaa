@@ -116,7 +116,7 @@ export async function sendWorkloadToTop({ token, datasetId, applicationId }) {
 // NOT gated behind TOP_ENABLED — it's the core generation path, not optional
 // forwarding. Returns the unsigned contract for display; nothing is
 // signed/stored/deployed by this call.
-export async function generateContractFromGovLayer({ token, datasets, applicationId, technique, infraIds }) {
+export async function generateContractFromGovLayer({ token, datasets, applicationId, technique, infraIds, purpose }) {
   const url = buildTopUrl('/generate-contract');
   const headers = buildTopHeaders({ jwt: token });
 
@@ -131,6 +131,9 @@ export async function generateContractFromGovLayer({ token, datasets, applicatio
       // InfraCat selection — SMPC only, omitted entirely when absent so
       // TEE/FL callers and older clients keep sending exactly what they did before.
       ...(infraIds?.length ? { infra_ids: infraIds } : {}),
+      // Stated purpose of processing (DPDP Rule 3 consent notice); gov_layer
+      // requires it for TEE.
+      ...(purpose ? { purpose } : {}),
     },
     { headers, timeout: 10000, validateStatus: () => true }
   );
@@ -281,6 +284,94 @@ export async function terminateTeeSession({ sessionId }) {
   return resp.data;
 }
 
+// Run TEE: gov_layer builds the CreateJob sub-contract from the generated
+// contract and runs grpcurl against the Kata coordinator (POST /v1/tee/run in
+// p3dx_gov_layer/internal/httpapi/job_tee.go). Resolves to
+// { status, subContract, job }.
+export async function runTeeJob({ contractId }) {
+  const url = buildOrchestratorUrl('/v1/tee/run');
+
+  const resp = await axios.post(url, { contract_id: contractId }, {
+    headers: { 'Content-Type': 'application/json' },
+    timeout: 75000,
+    validateStatus: () => true,
+  });
+
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(orchestratorErrorMessage(resp));
+    err.status = resp.status;
+    err.code = resp.data?.error;
+    throw err;
+  }
+
+  return resp.data;
+}
+
+// PUT /contracts/{contractId} — the consumer edits a TEE contract in place
+// (lifecycle dates, their name, dataset fields, workload; see gov_layer
+// contract_edit.go). gov_layer does not re-sign it, so the run gate refuses
+// it afterwards. accessToken is the consumer's own token (gov_layer checks
+// they generated the contract).
+export async function editContract({ contractId, changes, accessToken }) {
+  const url = buildTopUrl(`/contracts/${encodeURIComponent(contractId)}`);
+  const resp = await axios.put(url, changes, {
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+    timeout: 15000,
+    validateStatus: () => true,
+  });
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(govLayerErrorMessage(resp));
+    err.statusCode = resp.status;
+    err.data = resp.data;
+    throw err;
+  }
+  return resp.data;
+}
+
+// GET /workloads — gov_layer's catalogue of workloads a TEE contract can run.
+export async function listWorkloads() {
+  const resp = await axios.get(buildTopUrl('/workloads'), { timeout: 10000, validateStatus: () => true });
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(govLayerErrorMessage(resp));
+    err.statusCode = resp.status;
+    err.data = resp.data;
+    throw err;
+  }
+  return resp.data;
+}
+
+// Run TEE progress: gov_layer runs grpcurl GetJob against the Kata
+// coordinator (GET /v1/tee/jobs/{jobId}). Resolves to { status, job }.
+export async function getTeeJob({ jobId }) {
+  const url = buildOrchestratorUrl(`/v1/tee/jobs/${encodeURIComponent(jobId)}`);
+
+  const resp = await axios.get(url, { timeout: 30000, validateStatus: () => true });
+
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(orchestratorErrorMessage(resp));
+    err.status = resp.status;
+    throw err;
+  }
+
+  return resp.data;
+}
+
+// View Result: gov_layer fetches the job's result blob
+// (GET /v1/tee/jobs/{jobId}/result). Resolves to { status, result | output }.
+export async function getTeeJobResult({ jobId }) {
+  const url = buildOrchestratorUrl(`/v1/tee/jobs/${encodeURIComponent(jobId)}/result`);
+
+  const resp = await axios.get(url, { timeout: 45000, validateStatus: () => true });
+
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(orchestratorErrorMessage(resp));
+    err.status = resp.status;
+    throw err;
+  }
+
+  return resp.data;
+}
+
 // Participation-consent notifications (gov_layer's fl_notifications.go),
 // mounted at the same /api/v1 base as buildTopUrl above. Unlike POST
 // /contract, these endpoints take no auth token — gov_layer doesn't gate
@@ -358,6 +449,49 @@ export async function submitContractSignature({ contractId, providerUsername, no
       validateStatus: () => true,
     }
   );
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(govLayerErrorMessage(resp));
+    err.statusCode = resp.status;
+    err.data = resp.data;
+    throw err;
+  }
+  return resp.data;
+}
+
+// POST /contracts/{contractId}/withdraw-consent — a data provider withdraws
+// the consent they gave by signing a TEE contract (DPDP Act s.6(4)).
+// gov_layer clears their signature, so the run gate refuses further runs.
+// accessToken is the provider's own token — gov_layer takes the provider from it.
+export async function withdrawContractConsent({ contractId, notificationId, accessToken }) {
+  const url = buildTopUrl(`/contracts/${encodeURIComponent(contractId)}/withdraw-consent`);
+  const resp = await axios.post(
+    url,
+    { notification_id: notificationId },
+    {
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+      timeout: 10000,
+      validateStatus: () => true,
+    }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(govLayerErrorMessage(resp));
+    err.statusCode = resp.status;
+    err.data = resp.data;
+    throw err;
+  }
+  return resp.data;
+}
+
+// GET /jobs/user/{userId} — every job (contract) the user takes part in, as
+// consumer or as a data / infra provider, grouped per job with their
+// participation rows. gov_layer checks the caller's own Keycloak token.
+export async function getUserJobs({ userId, accessToken }) {
+  const url = buildTopUrl(`/jobs/user/${encodeURIComponent(userId)}`);
+  const resp = await axios.get(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    timeout: 15000,
+    validateStatus: () => true,
+  });
   if (resp.status < 200 || resp.status >= 300) {
     const err = new Error(govLayerErrorMessage(resp));
     err.statusCode = resp.status;
