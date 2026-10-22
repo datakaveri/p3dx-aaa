@@ -43,12 +43,14 @@ import {
   getTeeJob,
   getTeeJobResult,
   sendParticipationNotifications,
+  getRemovedSessionProviders,
   getRecipientNotifications,
   getSentNotifications,
   markParticipationNotificationRead,
   respondToParticipationNotification,
   submitContractSignature,
   withdrawContractConsent,
+  setContractConsentExpiry,
   getContractSignatures,
   getSessionContractSignatures,
   getUserJobs,
@@ -1398,6 +1400,25 @@ router.post('/keys/:roleName/public-key', verifyJWT, requireRole('user'), async 
 // own actions (read/respond) are always taken from the verified token, never
 // from the request body, so a provider can't act as someone else.
 
+// Usernames removed from an FL session for declining to participate a second time
+// (empty set when there's no submission id yet).
+async function removedUsernames(submissionId) {
+  if (!submissionId) return new Set();
+  const rows = await getRemovedSessionProviders({ submissionId });
+  return new Set(rows.map(r => r.username));
+}
+
+// GET /sessions/:submissionId/removed-providers — so the owner's page can mark
+// removed providers and keep them out of Send Message / Final Roster.
+router.get('/sessions/:submissionId/removed-providers', verifyJWT, async (req, res, next) => {
+  try {
+    const removed_providers = await getRemovedSessionProviders({ submissionId: req.params.submissionId });
+    return res.json({ status: 'SUCCESS', removed_providers });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /notify-providers — output owner sends (or re-sends) a participation
 // message to every requested data provider (today: the whole directory,
 // broadcast regardless of the owner's manual pick). The payload separately
@@ -1418,16 +1439,25 @@ router.post('/notify-providers', verifyJWT, async (req, res, next) => {
     }
 
     const senderUsername = req.user?.preferred_username || output_owner_id;
-    const recipients = requestedRoster
+    // Providers removed from this session (2nd decline) are never invited again
+    // and never listed to the others; gov_layer enforces the same.
+    const removed = await removedUsernames(submission_id);
+    const keep = p => p && !removed.has(p.username);
+    const requestedRemaining = requestedRoster.filter(keep);
+    const recipients = requestedRemaining
       .filter(p => p && p.id && p.username)
       .map(p => ({ id: p.id, username: p.username }));
     if (recipients.length === 0) {
-      return res.status(400).json({ status: 'FAILED', error: 'REQUESTED_PROVIDERS_MISSING_ID_OR_USERNAME' });
+      return res.status(400).json({
+        status: 'FAILED',
+        error: requestedRemaining.length ? 'REQUESTED_PROVIDERS_MISSING_ID_OR_USERNAME' : 'ALL_REQUESTED_PROVIDERS_REMOVED',
+      });
     }
 
-    const selectedRoster = Array.isArray(selected_providers) ? selected_providers : [];
-    const willingCount = Array.isArray(willing_providers) ? willing_providers.length : 0;
-    const message = `${senderUsername} requested ${requestedRoster.length} data provider(s)` +
+    const selectedRoster = (Array.isArray(selected_providers) ? selected_providers : []).filter(keep);
+    const willingRoster = (Array.isArray(willing_providers) ? willing_providers : []).filter(keep);
+    const willingCount = willingRoster.length;
+    const message = `${senderUsername} requested ${requestedRemaining.length} data provider(s)` +
       (submission_id ? ` for session ${submission_id}` : ' for a federated learning session') +
       (selectedRoster.length ? ` — ${selectedRoster.length} selected by the owner` : '') +
       ` — ${willingCount} confirmed willing so far.`;
@@ -1441,15 +1471,19 @@ router.post('/notify-providers', verifyJWT, async (req, res, next) => {
         submission_id,
         output_owner_id: output_owner_id || senderUsername,
         selected_providers: selectedRoster,
-        requested_providers: requestedRoster,
-        willing_providers: Array.isArray(willing_providers) ? willing_providers : [],
+        requested_providers: requestedRemaining,
+        willing_providers: willingRoster,
       },
     });
 
     console.log('[P3DX_STEP_OK] notify-providers: sent', {
       sender: senderUsername, recipients: recipients.length, submission_id,
     });
-    return res.status(201).json({ status: 'SUCCESS', created: result?.created ?? recipients.length });
+    return res.status(201).json({
+      status: 'SUCCESS',
+      created: result?.created ?? recipients.length,
+      skipped_removed: [...new Set([...requestedRoster.filter(p => p && removed.has(p.username)).map(p => p.username), ...(result?.skipped_removed || [])])],
+    });
   } catch (err) {
     next(err);
   }
@@ -1469,7 +1503,9 @@ router.post('/notify-providers', verifyJWT, async (req, res, next) => {
 router.post('/notify-roster', verifyJWT, async (req, res, next) => {
   try {
     const { selected_providers, willing_providers, output_owner_id, submission_id } = req.body || {};
-    const willingRoster = Array.isArray(willing_providers) ? willing_providers : [];
+    const removed = await removedUsernames(submission_id);
+    const willingRoster = (Array.isArray(willing_providers) ? willing_providers : [])
+      .filter(p => p && !removed.has(p.username));
     if (willingRoster.length === 0) {
       return res.status(400).json({ status: 'FAILED', error: 'MISSING_WILLING_PROVIDERS' });
     }
@@ -1482,7 +1518,8 @@ router.post('/notify-roster', verifyJWT, async (req, res, next) => {
       return res.status(400).json({ status: 'FAILED', error: 'WILLING_PROVIDERS_MISSING_ID_OR_USERNAME' });
     }
 
-    const selectedRoster = Array.isArray(selected_providers) ? selected_providers : [];
+    const selectedRoster = (Array.isArray(selected_providers) ? selected_providers : [])
+      .filter(p => p && !removed.has(p.username));
     const names = recipients.map(p => p.username).join(', ');
     const message = `${senderUsername} confirmed the final roster` +
       (submission_id ? ` for session ${submission_id}` : ' for this federated learning session') +
@@ -2191,6 +2228,47 @@ router.post('/contracts/:contractId/withdraw-consent', verifyJWT, async (req, re
       timestamp: new Date().toISOString(),
     });
     console.log('[P3DX_STEP_OK] contracts/withdraw-consent:', { providerId, contractId: req.params.contractId });
+    return res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /contracts/:contractId/consent-expiry — body { validUntil }.
+// The data provider sets when their consent on a TEE/SMPC contract ends,
+// before signing; gov_layer takes the provider from their own forwarded token.
+router.post('/contracts/:contractId/consent-expiry', verifyJWT, async (req, res, next) => {
+  try {
+    const roles = req.user?.realm_access?.roles || [];
+    if (!roles.includes('data-provider')) {
+      return res.status(403).json({ status: 'FAILED', error: 'INSUFFICIENT_ROLE' });
+    }
+    const validUntil = req.body?.validUntil;
+    if (!validUntil) {
+      return res.status(400).json({ status: 'FAILED', error: 'VALID_UNTIL_REQUIRED' });
+    }
+    const providerId = callerProviderId(req);
+    let result;
+    try {
+      result = await setContractConsentExpiry({
+        contractId: req.params.contractId,
+        validUntil,
+        accessToken: req.headers.authorization.split(' ')[1],
+      });
+    } catch (err) {
+      if (err.statusCode) {
+        return res.status(err.statusCode).json(err.data || { status: 'FAILED', error: err.message });
+      }
+      throw err;
+    }
+
+    await logAuditEvent('CONSENT_EXPIRY_SET', req.user.sub, {
+      contractId: req.params.contractId,
+      providerId,
+      validUntil,
+      timestamp: new Date().toISOString(),
+    });
+    console.log('[P3DX_STEP_OK] contracts/consent-expiry:', { providerId, contractId: req.params.contractId, validUntil });
     return res.json(result);
   } catch (err) {
     next(err);

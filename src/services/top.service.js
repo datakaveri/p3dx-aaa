@@ -393,6 +393,18 @@ export async function sendParticipationNotifications({ recipients, senderUsernam
   return resp.data;
 }
 
+// GET /sessions/{submissionId}/removed-providers — data providers removed from
+// an FL session for declining to participate a second time (gov_layer's
+// fl_negotiation.go).
+export async function getRemovedSessionProviders({ submissionId }) {
+  const url = buildTopUrl(`/sessions/${encodeURIComponent(submissionId)}/removed-providers`);
+  const resp = await axios.get(url, { timeout: 10000, validateStatus: () => true });
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new Error(govLayerErrorMessage(resp));
+  }
+  return resp.data?.removed_providers || [];
+}
+
 // GET /notifications/{username} — notifications addressed to this recipient.
 export async function getRecipientNotifications({ username }) {
   const url = buildTopUrl(`/notifications/${encodeURIComponent(username)}`);
@@ -467,6 +479,31 @@ export async function withdrawContractConsent({ contractId, notificationId, acce
   const resp = await axios.post(
     url,
     { notification_id: notificationId },
+    {
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+      timeout: 10000,
+      validateStatus: () => true,
+    }
+  );
+  if (resp.status < 200 || resp.status >= 300) {
+    const err = new Error(govLayerErrorMessage(resp));
+    err.statusCode = resp.status;
+    err.data = resp.data;
+    throw err;
+  }
+  return resp.data;
+}
+
+// POST /contracts/{contractId}/consent-expiry — a data provider sets when
+// their consent on a TEE/SMPC contract ends (validUntil: RFC 3339, or
+// "YYYY-MM-DD" for the end of that day UTC). gov_layer updates the contract
+// and re-sends the sign requests (the hash changes).
+// accessToken is the provider's own token — gov_layer takes the provider from it.
+export async function setContractConsentExpiry({ contractId, validUntil, accessToken }) {
+  const url = buildTopUrl(`/contracts/${encodeURIComponent(contractId)}/consent-expiry`);
+  const resp = await axios.post(
+    url,
+    { valid_until: validUntil },
     {
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
       timeout: 10000,
