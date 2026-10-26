@@ -590,8 +590,9 @@ export async function respondToParticipationNotification({ notificationId, usern
 // form so the contract's data-provider entries aren't left blank. restart
 // (set by "Start Again", see /gov/restart-fl-session) mints a new
 // project_id/contract_id for the session instead of reusing the existing one,
-// so the restart shows up as its own project.
-export async function buildSessionContract({ submissionId, outputOwnerUserId, parties, finalize, restart }) {
+// so the restart shows up as its own project. flConfig is the owner's training
+// parameters, sent as fl_config (required by gov_layer).
+export async function buildSessionContract({ submissionId, outputOwnerUserId, parties, finalize, restart, flConfig }) {
   const url = buildTopUrl('/contracts');
   const resp = await axios.post(
     url,
@@ -601,6 +602,8 @@ export async function buildSessionContract({ submissionId, outputOwnerUserId, pa
       parties,
       finalize: !!finalize,
       restart: !!restart,
+      // Training hyperparameters from the owner's form, signed into the contract.
+      fl_config: flConfig,
     },
     { headers: { 'Content-Type': 'application/json' }, timeout: 10000, validateStatus: () => true }
   );

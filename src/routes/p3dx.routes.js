@@ -60,7 +60,7 @@ import {
   getProjectBySession,
   listProjects,
 } from '../services/top.service.js';
-import { listProviderForms } from '../services/formSubmissions.service.js';
+import { listProviderForms, getSubmission, buildFlConfigFromSubmission } from '../services/formSubmissions.service.js';
 import axios from 'axios';
 import {
   KEY_PAIR_ROLES,
@@ -1489,6 +1489,17 @@ router.post('/notify-providers', verifyJWT, async (req, res, next) => {
   }
 });
 
+// The owner's filled form supplies the FL hyperparameters signed into the
+// contract (fl_config), which gov_layer requires. Throws (surfacing as the
+// route's contract_error) when the form can't be read or is incomplete.
+async function flConfigForSubmission(submissionId) {
+  const flConfig = buildFlConfigFromSubmission(await getSubmission(submissionId));
+  if (!flConfig) {
+    throw new Error(`FL training parameters missing or invalid in form submission ${submissionId}`);
+  }
+  return flConfig;
+}
+
 // POST /notify-roster — output owner sends the FINAL participant roster, once
 // every invited data provider has weighed in. Recipients are the providers who
 // actually confirmed willing (willing_providers) — this is a done-deal
@@ -1566,6 +1577,7 @@ router.post('/notify-roster', verifyJWT, async (req, res, next) => {
           outputOwnerUserId: output_owner_id || senderUsername,
           parties,
           finalize: true,
+          flConfig: await flConfigForSubmission(submission_id),
         });
         console.log('[P3DX_STEP_OK] notify-roster: contract finalized', {
           submission_id, contract_id: contractResult?.contract_id,
@@ -1768,6 +1780,7 @@ router.post('/gov/restart-fl-session', verifyJWT, async (req, res, next) => {
         parties,
         finalize: true,
         restart: true,
+        flConfig: await flConfigForSubmission(submission_id),
       });
       console.log('[P3DX_STEP_OK] restart-fl-session: new project/contract created', {
         submission_id, contract_id: contractResult?.contract_id,

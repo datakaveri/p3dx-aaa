@@ -85,6 +85,31 @@ export async function getSubmission(id) {
   return data || null;
 }
 
+// Maps the output owner's filled form (APD FormSubmission, fields at top
+// level) to gov_layer's POST /contracts `fl_config`, which gets signed into
+// the contract. Returns undefined when the submission is missing or any value
+// isn't a finite number (the caller treats that as an error). Range checks
+// are left to gov_layer (400 INVALID_FL_CONFIG).
+export function buildFlConfigFromSubmission(sub) {
+  if (!sub) return undefined;
+  const flConfig = {
+    num_rounds: Number(sub.num_server_rounds),
+    local_epochs: Number(sub.local_epochs),
+    learning_rate: Number(sub.learning_rate),
+    batch_size: Number(sub.batch_size),
+  };
+  // Number(null) is 0 and Number('') is 0 — treat absent values as missing.
+  const raw = [sub.num_server_rounds, sub.local_epochs, sub.learning_rate, sub.batch_size];
+  if (raw.some(v => v === null || v === undefined || v === '')) return undefined;
+  if (!Object.values(flConfig).every(Number.isFinite)) return undefined;
+  return {
+    num_rounds: Math.trunc(flConfig.num_rounds),
+    local_epochs: Math.trunc(flConfig.local_epochs),
+    learning_rate: flConfig.learning_rate,
+    batch_size: Math.trunc(flConfig.batch_size),
+  };
+}
+
 export async function deleteSubmission(id) {
   const { status } = await apdDelete(`/api/v1/forms/submissions/${encodeURIComponent(id)}`);
   if (status === 404) return false;
